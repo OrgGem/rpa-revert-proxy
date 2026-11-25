@@ -1,0 +1,4 @@
+# Enforce LF line endings for Linux server configs, scripts, and templates
+* text=auto eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf

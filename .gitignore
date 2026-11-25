@@ -1,0 +1,51 @@
+# Environment files (ONLY commit .env.example)
+.env
+.env.*
+!.env.example
+
+# TLS certificates, private keys & CSRs
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+!haproxy/certs/.gitkeep
+
+# SSH keys & local credentials
+id_rsa*
+id_ed25519*
+authorized_keys
+known_hosts
+*.secret
+
+# Rendered runtime configs (keep *.tpl tracked in Git)
+haproxy/haproxy.cfg
+host-setup/daemon.json
+docker-compose.override.yml
+
+# Runtime data, backups & logs
+backups/
+data/
+logs/
+*.log
+*.pid
+*.sock
+*.bak
+*.tmp
+
+# Python, Virtualenvs & Test cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# IDE, Local Index & OS files
+.vscode/
+.idea/
+.codegraph/
+*.swp
+.DS_Store
+Thumbs.db
+Desktop.ini
