@@ -22,6 +22,9 @@ known_hosts
 # Rendered runtime configs (keep *.tpl tracked in Git)
 haproxy/haproxy.cfg
 host-setup/daemon.json
+host-setup/rpa-dummy0.service
+host-setup/haproxy.service
+authentik/blueprints/10-openmanager-hub.yaml
 docker-compose.override.yml
 
 # Runtime data, backups & logs

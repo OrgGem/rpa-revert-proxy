@@ -1,26 +1,27 @@
-# RPA Revert Proxy — HAProxy (Zero-IP-Forward) & Authentik SSO + Roxy-WI
+# RPA Revert Proxy — HAProxy (Zero-IP-Forward) + Authentik SSO + HAProxy OpenManager
 
-Giải pháp triển khai **HAProxy Inbound (HTTPS / HTTP/2) & Outbound (TCP SNI Passthrough)** tuân thủ nghiêm ngặt ràng buộc bảo mật hệ điều hành `net.ipv4.ip_forward = 0` và cấm mở SSH liên server, kết hợp **Authentik Standalone Proxy Outpost** bọc xác thực SSO (OIDC) phía trước **Roxy-WI Community Edition**.
-
----
-
-## Điểm nhấn Kiến trúc
-
-* **Tuân thủ tuyệt đối `net.ipv4.ip_forward = 0`:** Toàn bộ lưu lượng chuyển đổi thành giao tiếp cục bộ trên Host (`INPUT`/`OUTPUT` chain) thông qua HAProxy (`network_mode: host`), `docker-proxy` trên `127.0.0.1` (Inbound) và interface ảo cố định `dummy0` `10.254.254.1/32` (Outbound).
-* **Tương thích 100% ứng dụng hiện hữu:** Không cần sửa mã nguồn ứng dụng, không cần cài Root CA nội bộ vào container; giữ nguyên hiệu lực chứng chỉ SSL gốc (hỗ trợ cả mTLS) ở chiều Outbound nhờ cơ chế `SNI Passthrough` kèm Whitelist tên miền.
-* **Bảo vệ Portal Quản trị Pre-Auth 100%:** Cô lập hoàn toàn `roxy-wi` trong mạng nội bộ `mgmt_internal` (không mở port ra Host/LAN), bắt buộc xác thực SSO & kiểm tra phân quyền Group/MFA qua `authentik-proxy` trước khi chạm tới Roxy-WI.
-* **Quản trị an toàn không cần SSH liên server:** Mỗi node vệ tinh vận hành cặp `authentik-proxy + roxy-wi` cục bộ, kết nối SSH đặc quyền tối thiểu (`roxyadmin`, không gán group `docker`) vào chính Host chứa nó và đồng bộ cấu hình zero-downtime (`master-worker` + `USR2`).
+Nền tảng triển khai **HAProxy 3.0 Inbound (HTTPS / HTTP/2) & Outbound (TCP SNI Passthrough)** dưới ràng buộc bảo mật nghiêm ngặt `net.ipv4.ip_forward = 0` (IPv4 & IPv6) và cấm mở SSH liên server, kết hợp **Control Plane Quản trị Đa Cụm Tập trung (`haproxy-openmanager`)** được bảo vệ bởi **Authentik Standalone Proxy SSO**.
 
 ---
 
-## Các Chế độ Triển khai Hỗ trợ
+## Điểm nhấn Kiến trúc (`v1.1.0`)
 
-1. **`local-all-in-one` (Môi trường Phát triển / Kiểm thử trên 01 Server):**
-   * Triển khai đồng thời cả cụm `Authentik Main` (`127.0.0.1:9001`) lẫn `authentik-proxy` độc lập (`127.0.0.1:9000`), `roxy-wi`, `haproxy` và `mock-app` ngay trên 01 máy chủ.
-   * Tái hiện **đúng 100%** luồng mạng `authentik-proxy` → `HAProxy Outbound SNI Passthrough` → `Authentik Main` như môi trường đa server.
-2. **`prod-hub` & `prod-satellite` (Môi trường Sản xuất Đa Server):**
-   * **01 Server Chính (`prod-hub`):** Vận hành `Authentik Main` tập trung.
-   * **N Server Vệ tinh (`prod-satellite`):** Giữ nguyên toàn bộ cấu hình của cụm vệ tinh, chỉ trỏ biến môi trường `AUTHENTIK_HOST` / `AUTHENTIK_MAIN_BACKEND_IP` về Server Chính qua cổng `443` (HTTPS/WSS).
+* **Loại bỏ `100%` NGINX trên toàn hệ thống:** Thay thế hoàn toàn NGINX ở cả tầng Edge Proxy lẫn bộ định tuyến nội bộ của OpenManager bằng `haproxy:3.0-alpine`.
+* **Quản trị Tập trung qua Cơ chế Pull-Agent (`Zero Inter-Server SSH`):**
+  * Chỉ vận hành **01 cụm `haproxy-openmanager` + `Authentik Main` + `authentik-proxy` duy nhất tại Server Chính (Hub)** để quản lý cấu hình, xem Version Diff, Rollback 1-click, phân phối SSL và theo dõi Real-time Metrics của toàn bộ hệ thống.
+  * Các **Server Vệ tinh (Satellites)** không cần cài đặt Web UI, RabbitMQ hay mở cổng SSH quản trị: chỉ chạy `haproxy-agent` siêu nhẹ chủ động gọi **Outbound HTTPS (`:443`)** về Hub mỗi `30s` để kéo cấu hình mới và đẩy metrics từ `/var/run/haproxy/admin.sock`.
+* **Tuân thủ tuyệt đối `ip_forward = 0` & Chống đi vòng Egress (`FR-03A`):** Tách biệt lưu lượng Inbound (`${HOST_LAN_IP}:443` → `127.0.0.1:<port>`) và Outbound SNI Passthrough (`dummy0` `10.254.254.1:443`), kết hợp Host Firewall chặn đứng mọi kết nối đi vòng qua IP trần, UDP `:443` (QUIC) hoặc IPv6.
+* **Khóa Bảo mật Chống Leo thang Đặc quyền (`Anti-RCE & 0600 Key Isolation`):**
+  * Vô hiệu hóa tính năng tự sửa/nâng cấp script từ xa và khóa bất biến file `/usr/local/bin/haproxy-agent` bằng `chattr +i` trên mọi Server vệ tinh.
+  * Tách biệt khóa riêng tư TLS `/etc/ssl/haproxy/*.pem` (`0600 root:root`) khỏi các tiến trình worker `haproxy` không đặc quyền (UID `99`).
+
+---
+
+## Ba Chế độ Triển khai Hỗ trợ Đồng nhất
+
+1. **`local-all-in-one` (Kiểm thử / PoC trọn bộ trên 01 Server Linux):** Chạy đồng thời Hub (`Authentik Main` + `authentik-proxy` + `OpenManager`) và Satellite (`HAProxy` + `haproxy-agent` + `mock-app`) trên cùng 01 máy chủ mà vẫn đi qua đúng luồng `dummy0` SNI Passthrough.
+2. **`prod-hub` (Server Chính — Central Control Plane):** Vận hành Edge HAProxy, `Authentik Main` (`server` + `worker` + `postgresql`), `authentik-proxy` và `haproxy-openmanager`.
+3. **`prod-satellite` (Các Server Vệ tinh 1..N):** Chỉ vận hành Edge/Outbound `HAProxy`, `haproxy-agent` (kéo cấu hình từ Hub qua HTTPS `:443`) và các container ứng dụng nghiệp vụ.
 
 ---
 
@@ -28,44 +29,34 @@ Giải pháp triển khai **HAProxy Inbound (HTTPS / HTTP/2) & Outbound (TCP SNI
 
 ```text
 .
-├── .agents/skills/               # Bộ kỹ năng chuyên biệt (Architecture, HAProxy, Authentik, Roxy-WI)
-├── AGENTS.md                     # Quy tắc dự án & quy trình đồng bộ .env.example <-> .env
-├── BRD.md                        # Tài liệu đặc tả yêu cầu nghiệp vụ & kỹ thuật chi tiết
-├── .env.example                  # Cấu trúc chuẩn biến môi trường (Single Source of Truth)
-├── host-setup/                   # Cấu hình OS: sysctl, dummy0 (10.254.254.1), daemon.json, sudoers, firewall
-├── haproxy/                      # Mẫu cấu hình haproxy.cfg.tpl và thư mục certs/
-│   └── certs/                    # Lưu trữ chứng chỉ TLS (.pem bị chặn bởi .gitignore)
-├── authentik/blueprints/         # Blueprint YAML khởi tạo tự động Provider, App, Group & Outpost
-├── mock-app/                     # Ứng dụng mẫu (Service A) phục vụ kiểm thử Inbound HTTP/2 & Outbound SNI
-├── scripts/                      # Công cụ kiểm tra biến môi trường, reload zero-downtime & cứu hộ
-│   └── check_env_sync.py         # Kiểm tra đồng bộ biến & an toàn cấu hình theo luồng Dev/Test/Prod
-└── tests/                        # Kịch bản kiểm thử tự động các tiêu chí nghiệm thu (UAT)
+├── .agents/skills/                     # 4 bộ kỹ năng chuyên biệt (Architecture, HAProxy, Authentik, OpenManager)
+├── AGENTS.md                           # Quy tắc phát triển & đồng bộ .env.example <-> .env
+├── BRD.md                              # Đặc tả yêu cầu nghiệp vụ & kỹ thuật v1.1.0
+├── docs/RUNBOOK.md                     # Sổ tay triển khai, vận hành, sao lưu DR & cứu hộ khẩn cấp
+├── .env.example                        # Schema biến môi trường chuẩn (Single Source of Truth)
+├── docker-compose.yml                  # Stack Data Plane HAProxy chạy trên mọi node
+├── docker-compose.hub.yml              # Stack Control Plane cho Hub & Local 1-Server
+├── docker-compose.mock-app.yml         # Ứng dụng mẫu Service A kiểm thử Inbound/Outbound/Egress
+├── host-setup/                         # Cấu hình sysctl, dummy0, daemon.json, systemd wrapper & CLI shim
+├── haproxy/                            # Mẫu haproxy.cfg.tpl & bộ định tuyến nội bộ openmanager-router.cfg
+├── authentik/blueprints/               # Blueprint YAML tự động tạo Group, Proxy Provider, App & Outpost
+├── scripts/                            # Công cụ check_env_sync, render_configs, cài đặt agent, DR & reload
+└── tests/                              # Bộ kiểm thử Offline & kịch bản 7 cổng PoC/UAT thực chiến
 ```
 
 ---
 
-## Khởi tạo Nhanh & Kiểm tra Biến Môi trường
+## Kiểm tra Nhanh & Khởi tạo Cấu hình
 
-Yêu cầu: `Python 3.9+` (để chạy công cụ kiểm tra cấu hình), `Docker Engine` & `Docker Compose v2` trên máy chủ Linux mục tiêu.
+```bash
+# 1. Đồng bộ .env từ .env.example (tự đặt quyền 0600, thêm khóa mới & thu hồi khóa cũ)
+python scripts/check_env_sync.py --sync
 
-1. **Khởi tạo hoặc đồng bộ file `.env` cục bộ từ `.env.example`** (tự động thêm biến mới mà không ghi đè các khóa/secret đã cấu hình):
-   ```bash
-   python scripts/check_env_sync.py --sync
-   ```
+# 2. Kiểm tra tính toàn vẹn biến môi trường & sinh toàn bộ file cấu hình theo DEPLOY_MODE
+python scripts/render_configs.py
 
-2. **Kiểm tra tính hợp lệ và an toàn của biến môi trường** trước khi chạy kiểm thử hoặc triển khai:
-   ```bash
-   python scripts/check_env_sync.py
-   ```
+# 3. Chạy bộ kiểm thử tự động Offline
+python tests/test_project_integrity.py
+```
 
----
-
-## Tài liệu Tham khảo Dự án
-
-* **Đặc tả Yêu cầu Nghiệp vụ & Kỹ thuật (BRD):** [BRD.md](./BRD.md)
-* **Quy tắc Phát triển & Đồng bộ Biến Môi trường:** [AGENTS.md](./AGENTS.md)
-* **Bộ Kỹ năng Chuyên biệt (`.agents/skills/`):**
-  * [zero-ip-forward-architecture](./.agents/skills/zero-ip-forward-architecture/SKILL.md)
-  * [haproxy-inbound-outbound](./.agents/skills/haproxy-inbound-outbound/SKILL.md)
-  * [authentik-proxy-sso](./.agents/skills/authentik-proxy-sso/SKILL.md)
-  * [roxy-wi-operations](./.agents/skills/roxy-wi-operations/SKILL.md)
+Hướng dẫn triển khai chi tiết từng bước xem tại: **[docs/RUNBOOK.md](./docs/RUNBOOK.md)** và **[BRD.md](./BRD.md)**.

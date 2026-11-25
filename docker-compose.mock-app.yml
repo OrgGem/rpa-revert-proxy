@@ -1,0 +1,26 @@
+# ==============================================================================
+# docker-compose.mock-app.yml — Business / Mock Service A for PoC & UAT Gates
+# Verifies Inbound HTTP/2, Outbound SNI Allowlist, and FR-03A Egress Blocking
+# ==============================================================================
+
+networks:
+  app_internal:
+    name: rpa_app_internal
+    driver: bridge
+
+services:
+  mock-app:
+    build:
+      context: ./mock-app
+    container_name: mock-service-a
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${APP_LOOPBACK_PORT}:${APP_CONTAINER_PORT}"
+    environment:
+      TZ: "${TZ}"
+      PORT: "${APP_CONTAINER_PORT}"
+      APP_TEST_OUTBOUND_DOMAIN: "${APP_TEST_OUTBOUND_DOMAIN}"
+    extra_hosts:
+      - "${APP_TEST_OUTBOUND_DOMAIN}:host-gateway"
+    networks:
+      - app_internal

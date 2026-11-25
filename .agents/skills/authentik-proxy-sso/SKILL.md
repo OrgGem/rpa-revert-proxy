@@ -1,47 +1,39 @@
 ---
 name: authentik-proxy-sso
 description: >-
-  Deploys and configures Authentik Main (for Local 1-Server Lab) and Authentik
-  Standalone Proxy Outposts (ghcr.io/goauthentik/proxy) protecting Roxy-WI across
-  single or multiple satellite servers. Use when editing Authentik Compose stacks,
-  Blueprints, Proxy Providers, Outpost tokens, or troubleshooting SSO/WSS flows.
+  Deploys and configures Authentik Main (Server + Worker, 2026.x Redis-free) and
+  Authentik Standalone Proxy Outpost (ghcr.io/goauthentik/proxy) protecting the
+  central HAProxy OpenManager Portal while allowing authenticated X-API-Key agent
+  pull endpoints. Use when editing Authentik stacks, Blueprints, or SSO/WSS flows.
 ---
 
-# Authentik Main & Standalone Proxy Outpost Integration
+# Authentik Main & Standalone Proxy Outpost for Central OpenManager
 
-Follow these rules whenever configuring `authentik-proxy`, `Authentik Main` (Local Lab or Hub), or Authentik Blueprints (`authentik/blueprints/`).
+Follow these rules whenever configuring `Authentik Main`, `authentik-proxy`, or Authentik Blueprints (`authentik/blueprints/`).
 
-## 1. Strict Image Version Pinning
+## 1. Architecture & Version Pinning
 
-- **NEVER use `ghcr.io/goauthentik/proxy:latest` or `ghcr.io/goauthentik/server:latest`**.
-  - Authentik does not maintain `:latest` on GHCR (`manifest unknown` error).
-  - Outpost version (`proxy:${AUTHENTIK_TAG}`) MUST match the exact `major.minor.patch` version of `server:${AUTHENTIK_TAG}` (e.g. `2026.8.3`), otherwise `/ws/outpost/` synchronization fails.
+1. **Exact Version Match**:
+   - Pin `ghcr.io/goauthentik/server:${AUTHENTIK_TAG}` (for both `server` and `worker` containers) and `ghcr.io/goauthentik/proxy:${AUTHENTIK_TAG}` to the exact same `YYYY.M.P` release (never `:latest`).
+   - Always deploy `authentik-worker` alongside `authentik-server` and `authentik-postgresql` (Authentik 2025.10+/2026.x is Redis-free; `worker` processes Blueprints, background tasks, and Outpost state).
+   - Map project `.env` variable `AUTHENTIK_OUTPOST_TOKEN` to container environment variable `AUTHENTIK_TOKEN` on `authentik-proxy`.
 
-## 2. Proxy Provider & Outpost Configuration Rules
+## 2. Central OpenManager Protection & Agent API Coexistence
 
-For each satellite node (and the local node in 1-server mode), provision a dedicated **Proxy Provider + Application + Outpost**:
-1. **Mode**: `Proxy` (Standalone Proxy — `authentik-proxy` reverses traffic directly to `roxy-wi`, no Lua/Forward-Auth plugin needed in HAProxy).
-2. **External host**: `https://${ROXYWI_PUBLIC_DOMAIN}` (must start with `https://`).
-3. **Internal host**: `https://roxy-wi:443` (Roxy-WI container serves HTTPS internally on `:443`, NOT HTTP `:8080`).
-4. **Internal host SSL Validation**: `false` (`internal_host_ssl_validation: false` in Blueprints, because Roxy-WI uses an internal self-signed cert).
-5. **Authorization flow**: `default-provider-authorization-implicit-consent` (**Implicit consent**) so admins moving across multiple satellite nodes via SSO are not prompted to click confirm on every node.
-6. **Access Policy**: Bind Group `${AUTHENTIK_ALLOWED_GROUP}` (e.g. `infra-admins`) with MFA enforced; unauthorized users must receive `HTTP 403` at `authentik-proxy` before reaching `roxy-wi`.
-7. **Token Blast-Radius Isolation**: Each satellite server gets its own Outpost and unique `AUTHENTIK_OUTPOST_TOKEN`.
+Unlike decentralized portals, **only ONE `authentik-proxy` Outpost is required** (deployed in front of `haproxy-openmanager` on the Hub, or on the single machine in `local-all-in-one` mode):
+1. **Proxy Provider Settings**:
+   - `mode`: `proxy` (Standalone Proxy).
+   - `external_host`: `https://${OPENMANAGER_PUBLIC_DOMAIN}`.
+   - `internal_host`: `${OPENMANAGER_INTERNAL_URL}` (`http://openmanager-router:8080` inside `mgmt_internal`).
+   - `internal_host_ssl_validation`: `false` (plain HTTP inside isolated `mgmt_internal` Docker bridge).
+   - `authorization_flow`: `default-provider-authorization-implicit-consent`.
+2. **RBAC Policy**:
+   - Bind Group `${AUTHENTIK_ALLOWED_GROUP}` (`infra-admins`) to the Application; non-members receive `HTTP 403` at `authentik-proxy` before touching OpenManager.
+3. **Coexistence with Satellite `haproxy-agent` Polling**:
+   - Human browsers (no `X-API-Key` header) ALWAYS route through `authentik-proxy` (`127.0.0.1:${AUTHENTIK_PROXY_LOOPBACK_PORT}`).
+   - Satellite `haproxy-agent` requests matching ONLY `/api/agents*`, `/api/clusters*`, or `/api/configuration/agents/*` WITH header `X-API-Key` route on HAProxy Inbound to `127.0.0.1:${OPENMANAGER_AGENT_API_LOOPBACK_PORT}` (`openmanager-router` -> `openmanager-backend:8000`), where `validate_agent_api_key` verifies the token.
 
-## 3. Networking Under `net.ipv4.ip_forward = 0`
+## 3. Outbound WSS Under `net.ipv4.ip_forward = 0`
 
-- `authentik-proxy` runs in custom bridge `mgmt_internal` (`${MGMT_SUBNET}`), exposing ONLY `"127.0.0.1:${AUTHENTIK_PROXY_PORT}:9000"` to the Host for HAProxy Inbound.
-- `authentik-proxy` MUST include:
-  ```yaml
-  extra_hosts:
-    - "${AUTHENTIK_DOMAIN}:host-gateway"
-  ```
-  so both OIDC token exchanges (`/application/o/token/`) and persistent Outpost WebSocket (`wss://${AUTHENTIK_DOMAIN}/ws/outpost/`) traverse HAProxy Outbound SNI Passthrough (`10.254.254.1:443`).
-- `AUTHENTIK_INSECURE`:
-  - Set `"true"` ONLY in `local-all-in-one` lab mode when using untrusted self-signed certs without mounting Root CA.
-  - MUST be `"false"` in Production (or mount internal enterprise CA bundle into `/etc/ssl/certs/`).
-
-## 4. Verification Steps
-
-- Check `docker logs authentik-proxy` for `Successfully connected websocket` to `wss://${AUTHENTIK_DOMAIN}/ws/outpost/`.
-- Unauthenticated `curl -I https://${ROXYWI_PUBLIC_DOMAIN}` returns `HTTP/2 302` redirecting to `https://${AUTHENTIK_DOMAIN}/...`.
+- `authentik-proxy` runs inside `mgmt_internal` (`${MGMT_SUBNET}`), exposing ONLY `"127.0.0.1:${AUTHENTIK_PROXY_LOOPBACK_PORT}:9000"`, with `extra_hosts: ["${AUTHENTIK_DOMAIN}:host-gateway"]` so `/ws/outpost/` and `/application/o/token/` traverse HAProxy Outbound SNI Passthrough (`${DUMMY_OUTBOUND_IP}:443`).
+- Failure mode: if `Authentik Main` is unreachable, new browser logins fail closed (`502`/`302`), while running HAProxy instances on all Satellite nodes continue serving live production traffic uninterrupted.

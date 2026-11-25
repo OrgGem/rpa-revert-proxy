@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
-import shutil
 import sys
 from pathlib import Path
 
@@ -15,8 +15,35 @@ ENV_PATH = ROOT_DIR / ".env"
 
 KEY_VALUE_RE = re.compile(r"^\s*([A-Z][A-Z0-9_]*)\s*=\s*(.*?)\s*$")
 TEMPLATE_VAR_RE = re.compile(r"(?<!\$)\$\{([A-Z][A-Z0-9_]*)(?::-[^}]*)?\}")
+PYTHON_ENV_RE = re.compile(r'os\.environ(?:\.get)?\(\s*["\']([A-Z][A-Z0-9_]*)["\']')
+
+PROJECT_VAR_PREFIXES = (
+    "DEPLOY_MODE",
+    "NODE_",
+    "TZ",
+    "HOST_",
+    "DUMMY_",
+    "MGMT_",
+    "HAPROXY_",
+    "OUTBOUND_",
+    "AUTHENTIK_",
+    "OPENMANAGER_",
+    "APP_",
+    "LOCAL_IDP_",
+)
+# Container-native runtime env names mapped inside Compose/scripts (not top-level .env schema keys)
+KNOWN_RUNTIME_ONLY_VARS = {
+    "AUTHENTIK_TOKEN",
+    "HAPROXY_CONTAINER_NAME",
+}
 SECRET_KEY_SUFFIXES = ("_TOKEN", "_PASSWORD", "_SECRET", "_SECRET_KEY")
-VALID_DEPLOY_MODES = {"local-all-in-one", "prod-satellite", "prod-hub"}
+VALID_DEPLOY_MODES = {"local-all-in-one", "prod-hub", "prod-satellite"}
+
+
+def is_project_schema_var(name: str) -> bool:
+    if name in KNOWN_RUNTIME_ONLY_VARS:
+        return False
+    return name.startswith(PROJECT_VAR_PREFIXES)
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -37,51 +64,99 @@ def parse_env_file(path: Path) -> dict[str, str]:
     return result
 
 
+def enforce_secure_permissions(path: Path) -> None:
+    """Enforce chmod 0600 on POSIX systems so secrets are never world/group-readable."""
+    if os.name == "posix" and path.exists():
+        os.chmod(path, 0o600)
+
+
 def collect_referenced_vars() -> dict[str, list[str]]:
-    """Find ${VAR} references across declarative Compose and .tpl files."""
+    """Scan Compose, templates, Blueprints, shell scripts, and mock-app for ${VAR} references."""
     refs: dict[str, list[str]] = {}
-    scan_patterns = [
+
+    def record(var_name: str, rel_path: str) -> None:
+        refs.setdefault(var_name, [])
+        if rel_path not in refs[var_name]:
+            refs[var_name].append(rel_path)
+
+    # 1. Declarative Compose & .tpl files: ALL ${VAR} references must exist in .env.example
+    strict_patterns = [
         "docker-compose*.yml",
         "docker-compose*.yaml",
         "haproxy/*.tpl",
         "host-setup/*.tpl",
+        "authentik/blueprints/*.tpl",
     ]
-    for pattern in scan_patterns:
+    for pattern in strict_patterns:
         for file_path in sorted(ROOT_DIR.glob(pattern)):
             rel = file_path.relative_to(ROOT_DIR).as_posix()
-            content = file_path.read_text(encoding="utf-8")
-            for match in TEMPLATE_VAR_RE.finditer(content):
+            for match in TEMPLATE_VAR_RE.finditer(file_path.read_text(encoding="utf-8")):
                 var_name = match.group(1)
-                refs.setdefault(var_name, [])
-                if rel not in refs[var_name]:
-                    refs[var_name].append(rel)
+                if var_name not in KNOWN_RUNTIME_ONLY_VARS:
+                    record(var_name, rel)
+
+    # 2. Shell scripts (*.sh) & skills (*.md): check project-prefixed ${VAR} references
+    scoped_patterns = [
+        "scripts/*.sh",
+        "host-setup/*.sh",
+        "tests/*.sh",
+        ".agents/skills/*/*.md",
+    ]
+    for pattern in scoped_patterns:
+        for file_path in sorted(ROOT_DIR.glob(pattern)):
+            rel = file_path.relative_to(ROOT_DIR).as_posix()
+            for match in TEMPLATE_VAR_RE.finditer(file_path.read_text(encoding="utf-8")):
+                var_name = match.group(1)
+                if is_project_schema_var(var_name):
+                    record(var_name, rel)
+
+    # 3. Mock-app Python files: check project-prefixed os.environ lookups
+    for file_path in sorted(ROOT_DIR.glob("mock-app/*.py")):
+        rel = file_path.relative_to(ROOT_DIR).as_posix()
+        for match in PYTHON_ENV_RE.finditer(file_path.read_text(encoding="utf-8")):
+            var_name = match.group(1)
+            if is_project_schema_var(var_name):
+                record(var_name, rel)
+
     return refs
 
 
-def sync_env_from_example(example_vars: dict[str, str], env_vars: dict[str, str]) -> int:
-    """Create .env or append missing variables from .env.example without overwriting existing keys."""
+def sync_env_from_example(example_vars: dict[str, str], env_vars: dict[str, str]) -> tuple[int, int]:
+    """Synchronize .env with .env.example: add missing keys, archive removed keys, enforce 0600."""
     if not ENV_PATH.exists():
-        shutil.copyfile(ENV_EXAMPLE_PATH, ENV_PATH)
-        print(f"[SYNC] Created {ENV_PATH.name} from {ENV_EXAMPLE_PATH.name}.")
-        return len(example_vars)
+        content = ENV_EXAMPLE_PATH.read_text(encoding="utf-8").replace("\r\n", "\n")
+        ENV_PATH.write_bytes(content.encode("utf-8"))
+        enforce_secure_permissions(ENV_PATH)
+        print(f"[SYNC] Initialized {ENV_PATH.name} from {ENV_EXAMPLE_PATH.name} (mode 0600 on POSIX).")
+        return len(example_vars), 0
 
-    missing_keys = [k for k in example_vars if k not in env_vars]
-    if not missing_keys:
-        print("[SYNC] .env already contains all keys from .env.example.")
-        return 0
+    added_keys = [k for k in example_vars if k not in env_vars]
+    removed_keys = [k for k in env_vars if k not in example_vars]
 
-    lines_to_append = [
-        "",
-        "# --- Auto-synced missing keys from .env.example ---",
-    ]
-    for key in missing_keys:
-        lines_to_append.append(f"{key}={example_vars[key]}")
+    # Rebuild .env following .env.example structure while preserving existing values
+    rebuilt_lines: list[str] = []
+    for raw_line in ENV_EXAMPLE_PATH.read_text(encoding="utf-8").splitlines():
+        match = KEY_VALUE_RE.match(raw_line)
+        if match:
+            key = match.group(1)
+            val = env_vars.get(key, example_vars[key])
+            rebuilt_lines.append(f"{key}={val}")
+        else:
+            rebuilt_lines.append(raw_line)
 
-    with ENV_PATH.open("a", encoding="utf-8") as fh:
-        fh.write("\n".join(lines_to_append) + "\n")
+    if removed_keys:
+        rebuilt_lines.append("")
+        rebuilt_lines.append("# --- Archived deprecated keys removed from .env.example ---")
+        for old_key in removed_keys:
+            rebuilt_lines.append(f"# [DEPRECATED] {old_key}={env_vars[old_key]}")
 
-    print(f"[SYNC] Appended {len(missing_keys)} missing key(s) to .env: {', '.join(missing_keys)}")
-    return len(missing_keys)
+    ENV_PATH.write_bytes(("\n".join(rebuilt_lines) + "\n").encode("utf-8"))
+    enforce_secure_permissions(ENV_PATH)
+    print(
+        f"[SYNC] Synchronized .env: +{len(added_keys)} added, -{len(removed_keys)} archived, "
+        f"existing values preserved."
+    )
+    return len(added_keys), len(removed_keys)
 
 
 def is_secret_key(key: str) -> bool:
@@ -90,12 +165,12 @@ def is_secret_key(key: str) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Check and sync environment variables between .env.example, .env, and templates."
+        description="Check and sync environment variables between .env.example, .env, and codebase."
     )
     parser.add_argument(
         "--sync",
         action="store_true",
-        help="Automatically create .env or append missing keys from .env.example.",
+        help="Create or synchronize .env with .env.example (adds new keys, archives stale keys, sets 0600).",
     )
     args = parser.parse_args()
 
@@ -115,8 +190,15 @@ def main() -> int:
 
     if not ENV_PATH.exists():
         errors.append("Missing .env file (run `python scripts/check_env_sync.py --sync` to initialize).")
+    elif os.name == "posix":
+        file_mode = ENV_PATH.stat().st_mode & 0o777
+        if file_mode & 0o077:
+            errors.append(
+                f"Insecure permissions on .env ({oct(file_mode)}): group/other permissions must be 0 "
+                f"(run `chmod 0600 .env` or `python scripts/check_env_sync.py --sync`)."
+            )
 
-    # 1. Check references in Compose & templates against .env.example
+    # 1. Check references across Compose, templates, scripts, skills & mock-app
     referenced_vars = collect_referenced_vars()
     for var_name, files in sorted(referenced_vars.items()):
         if var_name not in example_vars:
@@ -136,7 +218,8 @@ def main() -> int:
             )
         if extra_in_env:
             errors.append(
-                f"Unregistered keys present in .env but missing in .env.example: {', '.join(extra_in_env)}."
+                f"Unregistered/stale keys present in .env but missing in .env.example: "
+                f"{', '.join(extra_in_env)} (run with --sync to archive)."
             )
 
     # 3. Check Zero-Secret policy in .env.example
@@ -147,15 +230,16 @@ def main() -> int:
                 f"`CHANGE_ME_{key}` (found `{val}`)."
             )
 
-    # 4. Check architectural & mode-specific invariants
+    # 4. Check pinned tags & mode-specific invariants
     for source_name, mapping in ((".env.example", example_vars), (".env", env_vars)):
         if not mapping:
             continue
-        tag = mapping.get("AUTHENTIK_TAG", "").strip()
-        if not tag or tag.lower() == "latest":
-            errors.append(
-                f"Invalid AUTHENTIK_TAG in {source_name}: `{tag}` (must pin exact version, never `latest`)."
-            )
+        for tag_key in ("AUTHENTIK_TAG", "OPENMANAGER_TAG"):
+            tag_val = mapping.get(tag_key, "").strip()
+            if not tag_val or tag_val.lower() == "latest":
+                errors.append(
+                    f"Invalid {tag_key} in {source_name}: `{tag_val}` (must pin exact version, never `latest`)."
+                )
 
     if env_vars:
         mode = env_vars.get("DEPLOY_MODE", "")
@@ -163,26 +247,36 @@ def main() -> int:
             errors.append(
                 f"Invalid DEPLOY_MODE `{mode}` in .env (expected one of: {', '.join(sorted(VALID_DEPLOY_MODES))})."
             )
-        elif mode in {"prod-satellite", "prod-hub"}:
+        elif mode in {"prod-hub", "prod-satellite"}:
             if env_vars.get("AUTHENTIK_INSECURE", "").lower() == "true":
                 errors.append(
                     f"Production safety violation: AUTHENTIK_INSECURE cannot be `true` when DEPLOY_MODE={mode}."
                 )
+            if env_vars.get("OPENMANAGER_ALLOW_AGENT_SELF_UPGRADE", "false").lower() == "true":
+                errors.append(
+                    "Production safety violation: OPENMANAGER_ALLOW_AGENT_SELF_UPGRADE must be `false`."
+                )
+            # Validate required secrets for the active production role
+            hub_only_prefixes = (
+                "AUTHENTIK_OUTPOST_TOKEN",
+                "OPENMANAGER_POSTGRES_PASSWORD",
+                "OPENMANAGER_SECRET_KEY",
+                "LOCAL_IDP_POSTGRES_PASSWORD",
+                "LOCAL_IDP_SECRET_KEY",
+            )
+            sat_only_prefixes = ("OPENMANAGER_AGENT_TOKEN",)
             for key, val in env_vars.items():
-                if key.startswith("LOCAL_IDP_"):
+                if key.startswith("LOCAL_IDP_BOOTSTRAP_"):
+                    continue
+                if mode == "prod-satellite" and key.startswith(hub_only_prefixes):
+                    continue
+                if mode == "prod-hub" and key.startswith(sat_only_prefixes):
                     continue
                 if val.startswith("CHANGE_ME_") or val.startswith("dev_only_"):
                     errors.append(
                         f"Production secret violation: `{key}` still has placeholder/dev value in .env "
                         f"under DEPLOY_MODE={mode}."
                     )
-            if "*.local.test" in env_vars.get("AUTHENTIK_DOMAIN", "") or env_vars.get(
-                "AUTHENTIK_DOMAIN", ""
-            ).endswith(".local.test"):
-                warnings.append(
-                    f"AUTHENTIK_DOMAIN (`{env_vars.get('AUTHENTIK_DOMAIN')}`) still uses `.local.test` "
-                    f"under DEPLOY_MODE={mode}."
-                )
 
     for warning in warnings:
         print(f"[WARN] {warning}")
@@ -195,7 +289,7 @@ def main() -> int:
 
     print(
         f"[OK] Environment sync verified: {len(example_vars)} schema keys aligned, "
-        f"{len(referenced_vars)} template reference(s) covered, DEPLOY_MODE={env_vars.get('DEPLOY_MODE')}."
+        f"{len(referenced_vars)} codebase reference(s) covered, DEPLOY_MODE={env_vars.get('DEPLOY_MODE')}."
     )
     return 0
 

@@ -1,0 +1,208 @@
+# ==============================================================================
+# docker-compose.hub.yml — Central Control Plane Stack (prod-hub & local-all-in-one)
+# Includes: Authentik Main (Server + Worker) + Authentik Proxy + HAProxy OpenManager (Zero-Nginx)
+# ==============================================================================
+
+networks:
+  idp_internal:
+    name: rpa_idp_internal
+    driver: bridge
+  mgmt_internal:
+    name: rpa_mgmt_internal
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${MGMT_SUBNET}
+          gateway: ${MGMT_GATEWAY_IP}
+
+volumes:
+  authentik_pg_data:
+  authentik_media:
+  openmanager_pg_data:
+  openmanager_configs:
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. Authentik Main Identity Provider (2026.x Redis-Free: Postgres + Server + Worker)
+  # ----------------------------------------------------------------------------
+  authentik-postgresql:
+    image: ${LOCAL_IDP_POSTGRES_IMAGE}
+    container_name: authentik-postgresql
+    restart: unless-stopped
+    environment:
+      TZ: "${TZ}"
+      POSTGRES_DB: "${LOCAL_IDP_POSTGRES_DB}"
+      POSTGRES_USER: "${LOCAL_IDP_POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${LOCAL_IDP_POSTGRES_PASSWORD}"
+    volumes:
+      - authentik_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      start_period: 15s
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    networks:
+      - idp_internal
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_TAG}
+    container_name: authentik-server
+    restart: unless-stopped
+    command: ["server"]
+    ports:
+      - "127.0.0.1:${LOCAL_IDP_LOOPBACK_PORT}:9000"
+    environment:
+      TZ: "${TZ}"
+      AUTHENTIK_POSTGRESQL__HOST: "authentik-postgresql"
+      AUTHENTIK_POSTGRESQL__NAME: "${LOCAL_IDP_POSTGRES_DB}"
+      AUTHENTIK_POSTGRESQL__USER: "${LOCAL_IDP_POSTGRES_USER}"
+      AUTHENTIK_POSTGRESQL__PASSWORD: "${LOCAL_IDP_POSTGRES_PASSWORD}"
+      AUTHENTIK_SECRET_KEY: "${LOCAL_IDP_SECRET_KEY}"
+      AUTHENTIK_BOOTSTRAP_EMAIL: "${LOCAL_IDP_BOOTSTRAP_EMAIL}"
+      AUTHENTIK_BOOTSTRAP_PASSWORD: "${LOCAL_IDP_BOOTSTRAP_PASSWORD}"
+      AUTHENTIK_BOOTSTRAP_TOKEN: "${LOCAL_IDP_BOOTSTRAP_TOKEN}"
+      AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS: "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+    volumes:
+      - authentik_media:/media
+      - ./authentik/blueprints:/blueprints/custom:ro
+    depends_on:
+      authentik-postgresql:
+        condition: service_healthy
+    networks:
+      - idp_internal
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_TAG}
+    container_name: authentik-worker
+    restart: unless-stopped
+    command: ["worker"]
+    environment:
+      TZ: "${TZ}"
+      AUTHENTIK_POSTGRESQL__HOST: "authentik-postgresql"
+      AUTHENTIK_POSTGRESQL__NAME: "${LOCAL_IDP_POSTGRES_DB}"
+      AUTHENTIK_POSTGRESQL__USER: "${LOCAL_IDP_POSTGRES_USER}"
+      AUTHENTIK_POSTGRESQL__PASSWORD: "${LOCAL_IDP_POSTGRES_PASSWORD}"
+      AUTHENTIK_SECRET_KEY: "${LOCAL_IDP_SECRET_KEY}"
+      AUTHENTIK_BOOTSTRAP_EMAIL: "${LOCAL_IDP_BOOTSTRAP_EMAIL}"
+      AUTHENTIK_BOOTSTRAP_PASSWORD: "${LOCAL_IDP_BOOTSTRAP_PASSWORD}"
+      AUTHENTIK_BOOTSTRAP_TOKEN: "${LOCAL_IDP_BOOTSTRAP_TOKEN}"
+    volumes:
+      - authentik_media:/media
+      - ./authentik/blueprints:/blueprints/custom:ro
+    depends_on:
+      authentik-postgresql:
+        condition: service_healthy
+    networks:
+      - idp_internal
+
+  # ----------------------------------------------------------------------------
+  # 2. Single Authentik Standalone Proxy Outpost Protecting OpenManager UI
+  # ----------------------------------------------------------------------------
+  authentik-proxy:
+    image: ghcr.io/goauthentik/proxy:${AUTHENTIK_TAG}
+    container_name: authentik-proxy
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${AUTHENTIK_PROXY_LOOPBACK_PORT}:9000"
+    environment:
+      TZ: "${TZ}"
+      AUTHENTIK_HOST: "${AUTHENTIK_HOST}"
+      AUTHENTIK_TOKEN: "${AUTHENTIK_OUTPOST_TOKEN}"
+      AUTHENTIK_INSECURE: "${AUTHENTIK_INSECURE}"
+      AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS: "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+    extra_hosts:
+      # Traverses HAProxy Outbound SNI Passthrough (dummy0 10.254.254.1:443)
+      - "${AUTHENTIK_DOMAIN}:host-gateway"
+    networks:
+      - mgmt_internal
+
+  # ----------------------------------------------------------------------------
+  # 3. Central HAProxy OpenManager Control Plane (100% Zero-Nginx Stack)
+  # ----------------------------------------------------------------------------
+  openmanager-postgres:
+    image: ${OPENMANAGER_POSTGRES_IMAGE}
+    container_name: openmanager-postgres
+    restart: unless-stopped
+    environment:
+      TZ: "${TZ}"
+      POSTGRES_DB: "${OPENMANAGER_POSTGRES_DB}"
+      POSTGRES_USER: "${OPENMANAGER_POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${OPENMANAGER_POSTGRES_PASSWORD}"
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - openmanager_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mgmt_internal
+
+  openmanager-redis:
+    image: ${OPENMANAGER_REDIS_IMAGE}
+    container_name: openmanager-redis
+    restart: unless-stopped
+    command: ["redis-server", "--maxmemory", "512mb", "--maxmemory-policy", "volatile-lru", "--save", ""]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    networks:
+      - mgmt_internal
+
+  openmanager-backend:
+    image: taylanbakircioglu/haproxy-openmanager-backend:${OPENMANAGER_TAG}
+    container_name: openmanager-backend
+    restart: unless-stopped
+    environment:
+      TZ: "${TZ}"
+      DATABASE_URL: "postgresql://${OPENMANAGER_POSTGRES_USER}:${OPENMANAGER_POSTGRES_PASSWORD}@openmanager-postgres:5432/${OPENMANAGER_POSTGRES_DB}"
+      REDIS_URL: "redis://openmanager-redis:6379"
+      SECRET_KEY: "${OPENMANAGER_SECRET_KEY}"
+      DEBUG: "False"
+      LOG_LEVEL: "INFO"
+      PUBLIC_URL: "https://${OPENMANAGER_PUBLIC_DOMAIN}"
+      MANAGEMENT_BASE_URL: "https://${OPENMANAGER_PUBLIC_DOMAIN}"
+    volumes:
+      - openmanager_configs:/etc/haproxy
+    depends_on:
+      openmanager-postgres:
+        condition: service_healthy
+      openmanager-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - mgmt_internal
+
+  openmanager-frontend:
+    image: taylanbakircioglu/haproxy-openmanager-frontend:${OPENMANAGER_TAG}
+    container_name: openmanager-frontend
+    restart: unless-stopped
+    depends_on:
+      - openmanager-backend
+    networks:
+      - mgmt_internal
+
+  openmanager-router:
+    # Replaces upstream `haproxy-openmanager-nginx` with HAProxy 3.0 Alpine (Zero Nginx!)
+    image: ${HAPROXY_IMAGE}
+    container_name: openmanager-router
+    restart: unless-stopped
+    ports:
+      # Loopback port strictly used by Edge HAProxy for X-API-Key `/api/agents*` pull traffic
+      - "127.0.0.1:${OPENMANAGER_AGENT_API_LOOPBACK_PORT}:8080"
+    volumes:
+      - ./haproxy/openmanager-router.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - openmanager-backend
+      - openmanager-frontend
+    networks:
+      - mgmt_internal

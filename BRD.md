@@ -1,328 +1,284 @@
 # BUSINESS & TECHNICAL REQUIREMENTS DOCUMENT (BRD)
-## Dự án: Nền tảng Proxy Tập trung HAProxy (Zero-IP-Forward) & Portal Quản trị Xác thực Tập trung (Authentik SSO + Roxy-WI)
+## Dự án: Nền tảng Proxy Tập trung HAProxy (Zero-IP-Forward) & Control Plane Quản trị Đa Cụm (Authentik SSO + HAProxy OpenManager Pull-Agent)
 
 | Thông tin tài liệu | Chi tiết |
 | :--- | :--- |
-| **Mã dự án** | `RPA-PRORY` |
-| **Phiên bản** | `1.0.0` |
-| **Ngày lập** | `2026-11-25` |
-| **Trạng thái** | Bản thảo hoàn chỉnh — Sẵn sàng cho giai đoạn Phát triển & Kiểm thử PoC |
-| **Phạm vi triển khai** | Hỗ trợ đồng thời **Mô hình 1 Server (Local/PoC All-in-One)** và **Mô hình Đa Server (Production Hub & Spoke)** |
+| **Mã dự án** | `RPA-REVERT-PROXY` |
+| **Phiên bản** | `1.1.0` |
+| **Ngày cập nhật** | `2026-11-25` |
+| **Trạng thái** | Đã hiệu chỉnh toàn diện sau Technical Review — Sẵn sàng PoC & Kiểm thử Nghiệm thu |
+| **Phạm vi triển khai** | Hỗ trợ đồng thời **Mô hình 1 Server (`local-all-in-one`)** và **Mô hình Đa Server (`prod-hub` + `prod-satellite`)** |
+
+### Lịch sử Phiên bản
+| Phiên bản | Ngày | Nội dung thay đổi chính |
+| :--- | :--- | :--- |
+| `1.0.0` | `2026-11-25` | Bản đặc tả đầu tiên sử dụng mô hình Roxy-WI phân tán trên từng node vệ tinh kết hợp SSH cục bộ. |
+| `1.1.0` | `2026-11-25` | **Tái kiến trúc Control Plane sang `haproxy-openmanager` (Central Hub + Pull Agent qua HTTPS)**:<br>1. Quản trị tập trung toàn bộ các Server vệ tinh trên **01 giao diện duy nhất**, loại bỏ hoàn toàn SSH quản trị và gỡ bỏ gánh nặng container Roxy-WI/RabbitMQ khỏi các node vệ tinh.<br>2. Loại bỏ `100%` thành phần NGINX (kể cả container `nginx` mặc định trong OpenManager, thay bằng `openmanager-router` chạy `haproxy:3.0-alpine`).<br>3. Khóa bất biến `haproxy-agent` (`chattr +i`) chống RCE từ tính năng tự nâng cấp script từ xa; tách biệt khóa TLS `0600` với tiến trình worker UID `99`.<br>4. Bổ sung kiểm soát IPv6, `FR-03A` (Outbound Egress Enforcement), chuẩn hóa SLO Graceful Drain (`hard-stop-after`), Observability (Prometheus Exporter + Live Stats), Disaster Recovery (`RPO`/`RTO`) và 7 cổng kiểm thử PoC độc lập. |
 
 ---
 
 ## 1. Bối cảnh & Đặt vấn đề (Background & Problem Statement)
 
 ### 1.1. Hiện trạng & Thách thức
-1. **Rủi ro cảnh báo bảo mật (CVE):** Hệ thống reverse proxy hiện hữu dùng NGINX phát sinh nhiều cảnh báo lỗ hổng bảo mật liên quan đến bộ nhớ và thư viện đi kèm, gây áp lực lên quy trình kiểm toán an toàn thông tin (Security Audit).
+1. **Rủi ro cảnh báo bảo mật (CVE):** Hệ thống reverse proxy hiện hữu sử dụng NGINX thường xuyên phát sinh cảnh báo lỗ hổng bộ nhớ và thư viện phụ thuộc trong các đợt kiểm toán an toàn thông tin (Security Audit).
 2. **Ràng buộc hạ tầng mạng nghiêm ngặt (OS & Firewall Hardening):**
-   * Toàn bộ máy chủ bắt buộc tắt định tuyến gói tin ở tầng Kernel: `net.ipv4.ip_forward = 0`.
-   * Các ứng dụng nghiệp vụ chạy trong Docker ở chế độ mạng `bridge` cô lập (không được phép chạy `network_mode: host`). Khi `ip_forward = 0`, các container này hoàn toàn mất khả năng gọi trực tiếp ra Internet hoặc tới các hệ thống đối tác bên ngoài.
-   * Chính sách Firewall giữa các máy chủ **cấm mở cổng quản trị SSH (`Port 22`) liên server**, gây cản trở cho các công cụ quản trị tập trung truyền thống vốn dựa vào kết nối SSH từ xa.
-3. **Nhu cầu vận hành tập trung & kiểm soát truy cập chặt chẽ:**
-   * Đội ngũ vận hành cần giao diện Web UI mã nguồn mở (Roxy-WI Community Edition) để quản lý cấu hình, theo dõi trạng thái/log và reload HAProxy mà không tốn chi phí bản quyền thương mại.
-   * Tuy nhiên, bản Community không tích hợp sẵn OIDC/SSO và bản thân các công cụ quản trị web từng ghi nhận nhiều lỗ hổng nghiêm trọng (như `CVE-2026-33076`, `CVE-2026-33078`, `CVE-2026-22265`). Do đó, hệ thống bắt buộc phải có lớp cổng xác thực SSO/OIDC đứng chắn phía trước để triệt tiêu toàn bộ truy cập chưa xác thực (Pre-auth).
+   * Toàn bộ máy chủ bắt buộc tắt định tuyến gói tin ở tầng Kernel: `net.ipv4.ip_forward = 0` (và không cho phép đi vòng qua IPv6).
+   * Các ứng dụng nghiệp vụ chạy trong Docker ở chế độ mạng `bridge` cô lập (không được phép dùng `network_mode: host`). Khi `ip_forward = 0`, các container này mất hoàn toàn khả năng gọi trực tiếp ra Internet hoặc tới các hệ thống đối tác bên ngoài.
+   * Chính sách Firewall giữa các máy chủ **cấm mở cổng SSH (`Port 22`) liên server** và cấm mở các cổng quản trị từ bên ngoài chọc thẳng vào các máy chủ vệ tinh.
+3. **Nhu cầu Quản trị Tập trung, Giám sát Thực thi & Xác thực SSO:**
+   * Đội ngũ vận hành cần **một Control Plane Web UI mã nguồn mở duy nhất** để quản lý cấu hình, xem lịch sử phiên bản (Diff/Rollback), quản lý chứng chỉ SSL và giám sát lưu lượng thực tế của toàn bộ các máy chủ vệ tinh mà không tốn chi phí license thương mại.
+   * Giao diện quản trị bắt buộc được bảo vệ bởi lớp cổng xác thực tập trung **SSO/OIDC (Authentik)** nhằm chặn `100%` truy cập chưa xác thực (Pre-auth) từ bên ngoài.
 
 ### 1.2. Tầm nhìn Giải pháp
-Xây dựng một bộ khung cấu hình và tự động hóa triển khai (Infrastructure-as-Code) hoàn chỉnh dựa trên **HAProxy + Authentik Proxy Outpost + Roxy-WI**, cho phép:
-* Xử lý đồng thời lưu lượng **Inbound (HTTPS/HTTP2)** và **Outbound (TCP SNI Passthrough)** ngay trên từng máy chủ với `net.ipv4.ip_forward = 0`, không cần sửa mã nguồn hay can thiệp chứng chỉ SSL của ứng dụng.
-* Bọc xác thực SSO tập trung qua **Authentik** cho toàn bộ các Portal quản trị Roxy-WI trên nhiều máy chủ vệ tinh mà không cần mở SSH liên server.
-* Hỗ trợ **chế độ triển khai linh hoạt**: chạy trọn bộ trên **01 máy chủ duy nhất (Local/Dev Test Lab — cài đồng thời Authentik Main + Authentik Proxy + HAProxy + Roxy-WI)** để phát triển/kiểm thử đúng luồng thực tế trước khi tách thành **Cụm Đa Server (1 Hub + N Satellite Nodes)** trên Production.
+Xây dựng nền tảng Proxy và Quản trị Tập trung dựa trên **HAProxy 3.0 LTS + Authentik SSO + HAProxy OpenManager (Pull-Agent Architecture)**:
+* **Data Plane trên từng máy chủ:** HAProxy (`network_mode: host`) xử lý đồng thời chiều **Inbound (HTTPS / HTTP/2)** và chiều **Outbound (TCP SNI Passthrough qua `dummy0`)** với `net.ipv4.ip_forward = 0`, không sửa code ứng dụng và không thay đổi chứng chỉ SSL gốc của đối tác.
+* **Control Plane Tập trung (`Hub & Pull-Agent`):** Dựng duy nhất **01 cụm `haproxy-openmanager` + `Authentik Main` + `Authentik Proxy` tại Server Chính (Hub)**. Trên các **Server Vệ tinh (Satellites)** chỉ cài đặt daemon nhẹ **`haproxy-agent`** chủ động gọi **Outbound HTTPS (`:443`)** về Hub định kỳ để kéo cấu hình mới đã kiểm duyệt và đẩy số liệu thống kê thực tế lên Dashboard tập trung — hoàn toàn không cần mở SSH hay cổng quản trị Inbound trên các máy chủ vệ tinh.
+* **Chế độ Kiểm thử 01 Server (`local-all-in-one`):** Triển khai đồng thời cả cụm Hub lẫn cụm Satellite + Agent trên **01 máy chủ Linux duy nhất** để chứng minh thực nghiệm toàn bộ luồng mạng và cơ chế đồng bộ cấu hình trước khi nhân rộng ra nhiều máy chủ.
 
 ---
 
-## 2. Mục tiêu Dự án & Chỉ số Thành công (Objectives & KPIs)
+## 2. Mục tiêu Dự án & Chỉ số Đo lường (Objectives & SLOs)
 
-| Mã | Mục tiêu | Chỉ số đo lường thành công (KPIs) |
+| Mã | Mục tiêu | Chỉ số đo lường (KPIs / SLOs) |
 | :--- | :--- | :--- |
-| **BO-01** | **Tuân thủ tuyệt đối Hardening hạ tầng** | `sysctl net.ipv4.ip_forward` luôn bằng `0` (kể cả sau khi restart Docker hoặc reboot OS); `0` kết nối SSH mở giữa các server trên mạng LAN; `0` port nội bộ của container bị lộ trực tiếp ra LAN. |
-| **BO-02** | **Tương thích 100% ứng dụng hiện hữu** | `0` dòng code ứng dụng phải sửa đổi; `0` chứng chỉ Root CA nội bộ phải cài vào container nghiệp vụ; hỗ trợ đầy đủ HTTP/2 chiều vào và giữ nguyên chứng chỉ SSL gốc (kể cả mTLS) chiều ra. |
-| **BO-03** | **An toàn bảo mật Portal Quản trị & Tối ưu chi phí** | `100%` request chưa đăng nhập vào Roxy-WI bị chặn ở lớp `authentik-proxy` (HTTP `302`/`403`); tiết kiệm `100%` chi phí license Enterprise nhờ kiến trúc Proxy Outpost mã nguồn mở. |
-| **BO-04** | **Vận hành ổn định chuẩn Production** | Reload cấu hình HAProxy đạt **Zero-Downtime** (`0` request bị rớt khi reload); sự cố DNS của domain đối tác bên ngoài không làm gián đoạn chiều Inbound; thời gian dựng mới 1 node vệ tinh hoặc môi trường test 1-server dưới `15 phút`. |
+| **BO-01** | **Tuân thủ tuyệt đối Hardening & Chống rò rỉ Egress** | `sysctl net.ipv4.ip_forward = 0` và `net.ipv6.conf.all.forwarding = 0` bền vững qua khởi động lại Docker/OS; `0` cổng SSH liên server; `0` container NGINX trong toàn bộ hệ thống; `0` đường đi egress trái phép (IP trần, IPv6, UDP/QUIC) vượt qua HAProxy. |
+| **BO-02** | **Tương thích 100% ứng dụng hiện hữu** | `0` dòng mã nguồn ứng dụng phải sửa đổi; `0` chứng chỉ Root CA giả lập phải nhúng vào container nghiệp vụ; hỗ trợ HTTP/2 chiều vào và bảo toàn TLS/mTLS gốc chiều ra. |
+| **BO-03** | **Quản trị Tập trung 01 Màn hình & Bảo vệ Pre-Auth** | Quản lý toàn bộ `N` Server vệ tinh từ **01 Portal duy nhất** có sẵn Version Diff, 1-Click Rollback và Real-time Metrics; `100%` truy cập trình duyệt chưa xác thực vào Portal bị chặn tại `authentik-proxy` (`HTTP 302`/`403`). |
+| **BO-04** | **Độ sẵn sàng vận hành & Phục hồi thảm họa (Graceful Drain & DR)** | Khi reload cấu hình: **`0%` kết nối mới bị từ chối**, các kết nối đang hoạt động được **graceful drain tối đa trong ngưỡng `hard-stop-after` (mặc định `60s`)** trước khi đóng cưỡng chế worker cũ; chỉ tiêu phục hồi thảm họa đạt **`RPO <= 24h`** và **`RTO <= 30 phút`**. |
 
 ---
 
 ## 3. Phạm vi Dự án (Project Scope)
 
 ### 3.1. Trong phạm vi (In-Scope)
-* Thiết lập kịch bản chuẩn hóa hệ điều hành Host: cấu hình `sysctl`, interface ảo `dummy0` cố định IP Outbound, cấu hình `/etc/docker/daemon.json`, phân quyền thư mục `/etc/haproxy`, user SSH đặc quyền tối thiểu và rule Firewall nội bộ.
-* Xây dựng cấu hình chuẩn cho **HAProxy container (`network_mode: host`)**: tách biệt listener Inbound (L7 HTTP/2 + TLS Termination) và listener Outbound (L4 TCP SNI Passthrough + DNS Resolver an toàn).
-* Đóng gói cụm quản trị vệ tinh bằng Docker Compose: **Authentik Proxy Outpost** + **Roxy-WI** trên mạng nội bộ cô lập `mgmt_internal`.
-* Đóng gói cụm **Authentik Main (IdP)** dùng cho môi trường **Local/Single-Server Test** (và tài liệu/blueprint tích hợp với Authentik Main trên Production).
-* Xây dựng container ứng dụng mẫu (**Mock Service A**) để kiểm thử tự động cả 2 chiều Inbound và Outbound.
-* Xây dựng bộ công cụ vận hành & cứu hộ sự cố (**Break-glass CLI scripts**): kiểm tra cú pháp trước reload, khôi phục cấu hình khi HAProxy lỗi.
+* Chuẩn hóa tầng OS trên Linux (`Kernel >= 5.4`, `Docker Engine >= 24.0`): khóa IPv4/IPv6 forwarding, khởi tạo `dummy0` (`10.254.254.1/32`), cấu hình `/etc/docker/daemon.json`, thiết lập Egress/Ingress Firewall.
+* Triển khai Data Plane **HAProxy 3.0 Alpine (`network_mode: host`)** qua systemd wrapper `haproxy.service`: tách biệt Inbound HTTP/2, Outbound TCP SNI Passthrough, Stats Socket và Prometheus Exporter nội bộ (`:8405/metrics`).
+* Triển khai Control Plane **Central Hub** (`Authentik Main` gồm `server` + `worker` + `postgresql`, `authentik-proxy`, và `haproxy-openmanager` đã thay thế Nginx bằng `openmanager-router` HAProxy).
+* Xây dựng bộ cài đặt và khóa bảo mật **`haproxy-agent`** trên các Server vệ tinh: kết nối HTTPS Pull về Hub, cầu nối kiểm tra cú pháp/reload container HAProxy và khóa bất biến chống tự sửa script từ xa (`chattr +i`).
+* Xây dựng ứng dụng kiểm thử `mock-app` và bộ kiểm thử nghiệm thu tự động theo **7 cổng kỹ thuật PoC/UAT**.
 
 ### 3.2. Ngoài phạm vi (Out-of-Scope)
-* Sửa đổi mã nguồn nghiệp vụ của các ứng dụng hiện có hoặc can thiệp vào mã nguồn nội bộ của Roxy-WI Community để bỏ màn hình đăng nhập cục bộ bên trong Roxy-WI.
-* Quản lý lưu lượng Outbound cho các giao thức phi chuẩn không dùng tên miền/TLS SNI (VD: gọi thẳng bằng địa chỉ IP trần, UDP thô, hoặc dải port động FTP thụ động).
-* Triển khai hệ thống cân bằng tải đa vùng địa lý (Global Server Load Balancing) hoặc WAF chuyên sâu tầng L7 (có thể mở rộng ở giai đoạn sau).
+* Hỗ trợ lưu lượng Outbound cho các giao thức không mang trường TLS SNI hoặc không dùng TCP (như QUIC/HTTP3 trên UDP `:443`, TLS Encrypted Client Hello - ECH che giấu SNI, hoặc gọi trực tiếp bằng địa chỉ IP trần không qua tên miền).
+* Cân bằng tải mức DNS đa trung tâm dữ liệu (GSLB).
 
 ---
 
-## 4. Đối tượng Sử dụng & Ma trận Phân quyền (Stakeholders & RBAC)
+## 4. Kiến trúc Giải pháp Tổng thể (System Architecture)
 
-| Vai trò | Nhu cầu sử dụng | Quyền hạn trên hệ thống |
-| :--- | :--- | :--- |
-| **Infra / Platform Admin** | Cấu hình định tuyến Inbound/Outbound, cập nhật chứng chỉ SSL, reload HAProxy, xem log/metrics trên các node. | Thuộc Group `infra-admins` trên Authentik (bắt buộc bật MFA); được phép đi qua `authentik-proxy` vào Roxy-WI trên các server vệ tinh được cấp quyền; có quyền truy cập kênh Console/Bastion cứu hộ khẩn cấp. |
-| **App Developer / DevOps** | Khai báo port expose của container nghiệp vụ và danh sách tên miền đối tác (`Domain B`) cần gọi ra ngoài. | Không truy cập trực tiếp Roxy-WI Production (hoặc chỉ có quyền Read-only nếu được cấp); gửi yêu cầu mở whitelist domain qua quy trình vận hành. |
-| **Security Auditor** | Rà soát tuân thủ `ip_forward = 0`, quét CVE container, kiểm tra log truy cập SSO và cấu hình TLS. | Quyền xem Audit Log trên Authentik Main, kiểm tra cấu hình hệ thống định kỳ. |
-| **Người dùng ngoài / Chưa cấp quyền** | Truy cập các ứng dụng nghiệp vụ công khai qua chiều Inbound; không được phép chạm tới Portal quản trị. | Chỉ truy cập được các domain nghiệp vụ Inbound; bị chặn `302` (chưa đăng nhập) hoặc `403 Forbidden` (sai Group Policy) ngay tại `authentik-proxy` trước khi chạm tới Roxy-WI. |
-
----
-
-## 5. Kiến trúc Giải pháp Tổng thể (System Architecture)
-
-Hệ thống được thiết kế theo kiến trúc mô-đun thống nhất, cho phép chạy ở **2 chế độ triển khai** mà **không phải thay đổi cấu trúc mạng hay cơ chế định tuyến của HAProxy**.
-
-### 5.1. Nguyên lý Cốt lõi Vượt Ràng buộc `net.ipv4.ip_forward = 0`
-Khi `net.ipv4.ip_forward = 0`, Linux Kernel từ chối chuyển tiếp gói tin đi xuyên từ card mạng này sang card mạng khác (chain `FORWARD`). Giải pháp hóa giải hợp pháp ràng buộc này bằng cách chuyển toàn bộ luồng mạng thành **giao tiếp cục bộ tới/từ chính Host** (chain `INPUT` và `OUTPUT`):
-1. **Chiều Inbound:** Client ngoài gọi tới `<Host_LAN_IP>:443` → HAProxy (chạy `network_mode: host`) nhận gói tin tại chain `INPUT`, giải mã TLS/HTTP2, rồi mở kết nối mới từ Host tới `127.0.0.1:<port_expose>` → tiến trình `docker-proxy` ở userspace tiếp nhận và chuyển thẳng vào container ứng dụng.
-2. **Chiều Outbound:** Container trong mạng `bridge` phân giải `<domain-b>` (nhờ `extra_hosts: "<domain-b>:host-gateway"`) về IP ảo cố định `10.254.254.1` trên interface `dummy0` của Host → gói tin đi vào chain `INPUT` của Host tại `10.254.254.1:443` → HAProxy đọc trường `SNI` trong gói `TLS ClientHello` (không giải mã TLS), đối chiếu danh sách cho phép (Whitelist) rồi dùng stack mạng của Host mở kết nối TCP thẳng ra `<domain-b>:443` bên ngoài.
-
-### 5.2. Chế độ 1: Mô hình Sản xuất Đa Server (Multi-Server Production)
-Gồm **01 Server Chính** vận hành `Authentik Main (IdP)` và **N Server Vệ tinh** vận hành độc lập bộ `HAProxy + Authentik Proxy + Roxy-WI + Ứng dụng nghiệp vụ`. Giữa các server chỉ giao tiếp qua cổng `443` (HTTPS/WSS), hoàn toàn không mở SSH liên server.
+### 4.1. Mô hình Sản xuất Đa Server (`prod-hub` + `prod-satellite`)
 
 ```mermaid
 flowchart TB
-    subgraph External["Mạng Ngoài / Đối tác & Quản trị viên"]
+    subgraph External["Người dùng, Quản trị viên & Đối tác Ngoài"]
         Admin["Infra Admin (Trình duyệt)"]
         ExtUser["Người dùng Ứng dụng"]
         PartnerAPI["Đối tác bên ngoài (Domain B :443)"]
     end
 
-    subgraph MainServer["Server Chính (Authentik Hub)"]
-        AuthMain["Authentik Main IdP (auth.main-domain.com:443)"]
-    end
-
-    subgraph SatServer["Server Vệ tinh 1..N (net.ipv4.ip_forward = 0)"]
-        subgraph HostNet["Host Network Stack (network_mode: host)"]
-            HAP_In["HAProxy Inbound (Host_LAN_IP:80, :443)"]
-            HAP_Out["HAProxy Outbound SNI (dummy0 10.254.254.1:443)"]
-            SSHD["Host SSHD (Chỉ nhận từ 172.25.0.0/24 :22)"]
-            EtcHaproxy["/etc/haproxy (Bind Mount)"]
+    subgraph HubServer["Server Chính — Central Control Plane (prod-hub)"]
+        HubHAP["Hub HAProxy Edge (Host_LAN_IP:443 & dummy0:443)"]
+        subgraph HubMgmtNet["Docker Bridge: mgmt_internal"]
+            AuthProxy["authentik-proxy (127.0.0.1:9000)"]
+            OMRouter["openmanager-router (HAProxy 3.0 - Zero Nginx)"]
+            OMFront["openmanager-frontend (:3000)"]
+            OMBack["openmanager-backend (:8000, Postgres & Redis)"]
         end
-
-        subgraph MgmtBridge["Docker Bridge: mgmt_internal (172.25.0.0/24)"]
-            AuthProxy["authentik-proxy (127.0.0.1:9000 -> :9000)"]
-            RoxyWI["roxy-wi (Cô lập hoàn toàn, HTTPS :443)"]
-        end
-
-        subgraph AppBridge["Docker Bridge: app_net"]
-            ServiceA["Ứng dụng Nghiệp vụ - Service A (127.0.0.1:8081 -> :8080)"]
+        subgraph HubIdpNet["Docker Bridge: idp_internal"]
+            AuthMain["Authentik Main (Server + Worker + Postgres, 127.0.0.1:9001)"]
         end
     end
 
-    ExtUser -->|"HTTPS (HTTP/2)"| HAP_In
-    Admin -->|"HTTPS (roxy-node1.domain.com)"| HAP_In
-    HAP_In -->|"127.0.0.1:8081 (docker-proxy)"| ServiceA
-    HAP_In -->|"127.0.0.1:9000 (docker-proxy)"| AuthProxy
-    AuthProxy -->|"HTTPS nội bộ (:443)"| RoxyWI
-    RoxyWI -->|"SSH cục bộ (host.docker.internal:22)"| SSHD
-    SSHD -->|"Ghi config & gửi USR2"| EtcHaproxy
+    subgraph SatServer["Server Vệ tinh 1..N (prod-satellite, ip_forward = 0)"]
+        subgraph SatHost["Host Network Stack"]
+            SatHAP_In["HAProxy Inbound (Sat_LAN_IP:80, :443)"]
+            SatHAP_Out["HAProxy Outbound SNI (dummy0 10.254.254.1:443)"]
+            SatStats["Stats Socket & Prometheus (:8405/metrics)"]
+            SatAgent["haproxy-agent (Systemd Daemon, chattr +i locked)"]
+        end
+        subgraph SatAppNet["Docker Bridge: app_internal"]
+            ServiceA["Ứng dụng Nghiệp vụ - Service A (127.0.0.1:8081)"]
+        end
+    end
 
-    ServiceA -->|"extra_hosts -> 10.254.254.1:443"| HAP_Out
-    AuthProxy -->|"extra_hosts -> 10.254.254.1:443"| HAP_Out
-    HAP_Out -->|"TCP SNI Passthrough"| PartnerAPI
-    HAP_Out -->|"TCP SNI Passthrough (HTTPS/WSS)"| AuthMain
+    Admin -->|"1. HTTPS Browser (SSO)"| HubHAP
+    HubHAP -->|"Browser (!X-API-Key)"| AuthProxy
+    AuthProxy -->|"Đã xác thực Group infra-admins"| OMRouter
+    OMRouter --> OMFront
+    OMRouter --> OMBack
+    HubHAP <-->|"SSO / Outpost WSS"| AuthMain
+
+    SatAgent -->|"2. Outbound HTTPS Pull (30s, X-API-Key)"| HubHAP
+    HubHAP -->|"/api/agents* + X-API-Key"| OMRouter
+    SatAgent -->|"3. Validate haproxy -c & SIGUSR2 Reload"| SatHAP_In
+    SatAgent <-->|"Đọc CSV Metrics"| SatStats
+
+    ExtUser -->|"HTTPS (HTTP/2)"| SatHAP_In
+    SatHAP_In -->|"127.0.0.1:8081 (docker-proxy)"| ServiceA
+    ServiceA -->|"extra_hosts -> 10.254.254.1:443"| SatHAP_Out
+    SatHAP_Out -->|"TCP SNI Passthrough"| PartnerAPI
 ```
 
-### 5.3. Chế độ 2: Mô hình Kiểm thử / Phát triển trên 01 Server Duy nhất (Single-Server Lab / PoC)
-Trong giai đoạn phát triển hoặc khi chỉ có **01 máy chủ duy nhất**, hệ thống triển khai **cả `Authentik Main` lẫn `Authentik Proxy` tách rời trên cùng một máy** (thay vì dùng Embedded Outpost có sẵn của Authentik Main) nhằm **mô phỏng chính xác 100% đường đi mạng của Server Vệ tinh**:
+### 4.2. Mô hình Kiểm thử Trọn bộ Trên 01 Server (`local-all-in-one`)
+Khi phát triển hoặc kiểm thử trên **01 máy chủ Linux duy nhất**, toàn bộ các thành phần của `HubServer` và `SatServer` cùng chạy trên một máy với `net.ipv4.ip_forward = 0`:
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Browser as Trình duyệt Admin
-    participant HAP_In as HAProxy Inbound (Host_LAN_IP:443)
+    participant Admin as Trình duyệt Admin
+    participant HAP as HAProxy (Host_LAN_IP:443 & 10.254.254.1:443)
     participant AProxy as authentik-proxy (mgmt_internal)
-    participant HAP_Out as HAProxy Outbound (10.254.254.1:443)
-    participant AMain as Authentik Main (idp_internal, 127.0.0.1:9001)
-    participant Roxy as roxy-wi (mgmt_internal :443)
+    participant AMain as Authentik Main (idp_internal :9001)
+    participant OM as HAProxy OpenManager (mgmt_internal)
+    participant Agent as haproxy-agent (Host Systemd Daemon)
 
-    Note over AProxy,AMain: Khi khởi động trên 1 Server (ip_forward = 0):
-    AProxy->>HAP_Out: Kết nối WSS tới auth.local.test (phân giải ra 10.254.254.1:443)
-    HAP_Out->>HAP_In: Kiểm tra SNI = auth.local.test -> Chuyển tiếp TCP tới Host_LAN_IP:443
-    HAP_In->>AMain: Giải mã TLS -> Chuyển về 127.0.0.1:9001 (Đồng bộ Outpost thành công)
+    Note over AProxy,AMain: Luồng Outpost WSS qua SNI Passthrough (ip_forward = 0):
+    AProxy->>HAP: Kết nối WSS auth.local.test (extra_hosts -> 10.254.254.1:443)
+    HAP->>AMain: SNI = auth.local.test -> Host_LAN_IP:443 -> 127.0.0.1:9001
 
-    Note over Browser,Roxy: Khi Quản trị viên truy cập Portal:
-    Browser->>HAP_In: GET https://roxy-node1.local.test
-    HAP_In->>AProxy: Forward tới 127.0.0.1:9000
-    AProxy-->>Browser: HTTP 302 Redirect sang https://auth.local.test/application/o/authorize/...
-    Browser->>HAP_In: Đăng nhập SSO trên https://auth.local.test
-    HAP_In->>AMain: Xác thực User + MFA + Kiểm tra Group Policy (127.0.0.1:9001)
-    AMain-->>Browser: HTTP 302 Callback kèm Authorization Code về roxy-node1.local.test
-    Browser->>HAP_In: GET /outpost.goauthentik.io/callback?code=...
-    HAP_In->>AProxy: Chuyển tới 127.0.0.1:9000
-    AProxy->>HAP_Out: Đổi Code lấy Token tới auth.local.test (qua 10.254.254.1:443)
-    HAP_Out->>HAP_In: TCP SNI Passthrough về Host_LAN_IP:443 -> 127.0.0.1:9001
-    AProxy->>Roxy: Cho phép đi qua -> Proxy tới https://roxy-wi:443
+    Note over Admin,OM: Quản trị viên sửa cấu hình Proxy tập trung:
+    Admin->>HAP: Truy cập https://portal.local.test
+    HAP->>AProxy: Chuyển tới 127.0.0.1:9000 (Chưa có X-API-Key)
+    AProxy-->>Admin: HTTP 302 Redirect đăng nhập SSO tại auth.local.test
+    Admin->>OM: Sau SSO (Group infra-admins) -> Tạo/Sửa Frontend/Backend & bấm Apply Changes
+
+    Note over Agent,HAP: Agent tự động kéo cấu hình mới & cập nhật HAProxy:
+    Agent->>HAP: GET https://portal.local.test/api/agents/node1/config (Header: X-API-Key)
+    HAP->>OM: Khớp ACL /api/agents* + X-API-Key -> Xác thực Agent Token -> Trả Partial Config
+    Agent->>Agent: Ghép global + resolvers + defaults cục bộ với Frontends/Backends mới
+    Agent->>HAP: Chạy shim haproxy -c kiểm tra cú pháp -> systemctl reload haproxy (SIGUSR2)
+    Agent->>OM: POST /api/agents/node1/config-applied & đẩy CSV Stats lên Dashboard
 ```
 
-> **Giá trị cốt lõi của thiết kế 1-Server này:** Khi chuyển từ môi trường 1-Server Local lên Production Đa Server, toàn bộ cấu hình của cụm Vệ tinh (`HAProxy`, `authentik-proxy`, `roxy-wi`, script OS) **giữ nguyên 100%**, chỉ thay đổi duy nhất biến môi trường tên miền và IP đích của `Authentik Main` trong file `.env`.
+---
+
+## 5. Yêu cầu Chức năng Chi tiết (Functional Requirements)
+
+### FR-01: Chuẩn hóa Tầng Hệ điều hành, Khóa IPv4/IPv6 & Docker Daemon
+1. **Ma trận nền tảng hỗ trợ:** Hệ điều hành Ubuntu 22.04/24.04 LTS hoặc RHEL/Rocky/AlmaLinux 8/9 (`Linux Kernel >= 5.4`), `Docker Engine >= 24.0` kèm `Docker Compose v2`.
+2. **Vô hiệu hóa hoàn toàn định tuyến gói tin (IPv4 & IPv6):**
+   * Cấu hình `/etc/sysctl.d/99-haproxy-zero-fwd.conf`: `net.ipv4.ip_forward = 0`, `net.ipv6.conf.all.forwarding = 0`, `net.ipv6.conf.default.forwarding = 0`, `net.ipv4.conf.all.rp_filter = 2`.
+   * Cấu hình `/etc/docker/daemon.json`: `"ip-forward": false`, `"ipv6": false`, `"ip": "127.0.0.1"`, `"userland-proxy": true`, `"host-gateway-ip": "10.254.254.1"`.
+3. **Giao diện ảo `dummy0` bền vững:** Systemd unit `rpa-dummy0.service` khởi tạo `dummy0` mang IP `10.254.254.1/32` trước khi `docker.service` khởi chạy, đảm bảo HAProxy luôn bind thành công kể cả khi mọi mạng Docker đang tắt.
+
+### FR-02: Định tuyến Chiều Inbound trên HAProxy (HTTP/2 & Dual-Path Hub Routing)
+1. Triển khai `haproxy:3.0-alpine` ở `network_mode: host`, quản lý qua `haproxy.service` để đồng bộ vòng đời với systemd và `haproxy-agent`.
+2. Bind tách biệt `${HOST_LAN_IP}:80` (redirect `301` sang HTTPS) và `${HOST_LAN_IP}:443` (`ssl crt /etc/ssl/haproxy/ alpn h2,http/1.1`, `TLSv1.2+`, `tune.bufsize 32768`).
+3. Làm sạch chống giả mạo header từ phía client: xóa trước và gán mới `X-Forwarded-Proto: https`, xóa các header `X-authentik-*` do client bên ngoài tự chèn trước khi đẩy xuống backend.
+4. **Định tuyến Kép cho Portal Quản trị (`${OPENMANAGER_PUBLIC_DOMAIN}`) trên Hub / Local 1-Server:**
+   * **Luồng Agent Pull:** Chỉ khi request đồng thời khớp đường dẫn `/api/agents*`, `/api/clusters*` hoặc `/api/configuration/agents/*` **và** có mặt header `X-API-Key`, HAProxy chuyển thẳng về `127.0.0.1:${OPENMANAGER_AGENT_API_LOOPBACK_PORT}` (`openmanager-router` → `openmanager-backend:8000`) để xác thực khóa `X-API-Key` của Agent.
+   * **Luồng Trình duyệt Quản trị:** Toàn bộ các request còn lại vào `${OPENMANAGER_PUBLIC_DOMAIN}` bắt buộc đi qua `127.0.0.1:${AUTHENTIK_PROXY_LOOPBACK_PORT}` (`authentik-proxy`).
+
+### FR-03: Định tuyến Chiều Outbound qua TCP SNI Passthrough
+1. Frontend Outbound lắng nghe cố định tại `10.254.254.1:443` (`mode tcp`), bật `tcp-request inspect-delay 5s`, chỉ chấp nhận gói `TLS ClientHello` (`req.ssl_hello_type 1`) và từ chối tường minh mọi kết nối còn lại (`tcp-request content reject`).
+2. Định tuyến không giải mã TLS theo danh sách `req.ssl_sni -i <domain>`:
+   * Đặt block `resolvers host_dns` ngay sau `global` (trước `defaults`) sử dụng DNS thật của Host (`accepted_payload_size 8192`).
+   * Các backend đối tác bên ngoài dùng `default-server init-addr last,libc,none resolvers host_dns resolve-prefer ipv4` và **tắt `check`** chủ động.
+   * Nếu ứng dụng gọi một dịch vụ bên ngoài có chuyển hướng sang domain phụ (VD: cổng đăng nhập OAuth hoặc CDN phụ), toàn bộ các hostname phát sinh phải được khai báo tường minh trong danh sách allowlist và `extra_hosts`.
+
+### FR-03A: Kiểm soát Cưỡng chế Lưu lượng Chiều ra (Outbound Egress Enforcement)
+Nhằm đảm bảo SNI Allowlist không bị đi vòng qua bởi các kết nối ngoài luồng:
+1. Cấu hình Host Firewall chặn mặc định (`DROP`/`REJECT`) trên chain `FORWARD` đối với cả IPv4 và IPv6 từ `docker0` và `br-+`.
+2. Trên chain `INPUT` của Host, từ các interface `docker0` và `br-+`, chỉ cho phép kết nối TCP tới `10.254.254.1:443` (luồng HAProxy Outbound SNI Passthrough) và lưu lượng nội bộ cần thiết của DNS/loopback; **chặn hoàn toàn UDP `:443` (QUIC/HTTP3)** và các cổng trái phép khác từ mạng container vào Host.
+3. Mọi nỗ lực từ bên trong container gọi thẳng ra IP công cộng trần (VD: `https://1.1.1.1`), gọi qua IPv6, hoặc gửi SNI giả mạo không khớp chứng chỉ đích đều phải thất bại kiểm chứng mạng/TLS.
+
+### FR-04: Tích hợp Ứng dụng Nghiệp vụ (`Service A` & `Mock App`)
+1. Các container ứng dụng giữ nguyên mạng `bridge`, chỉ publish port vào loopback `"127.0.0.1:${APP_LOOPBACK_PORT}:${APP_CONTAINER_PORT}"`.
+2. Khai báo `extra_hosts: ["<domain-b>:host-gateway"]` (tự động phân giải về `10.254.254.1`).
+
+### FR-05: Xác thực SSO với `Authentik Main` (Server + Worker) & `Authentik Proxy`
+1. Cụm `Authentik Main` (phiên bản ghim cứng `${AUTHENTIK_TAG}`, kiến trúc `2026.x` không dùng Redis) bắt buộc triển khai đầy đủ 3 thành phần: **`authentik-postgresql`**, **`authentik-server`** và **`authentik-worker`** (xử lý tác vụ nền, nạp Blueprints và quản lý trạng thái Outpost).
+2. Triển khai **duy nhất 01 container `authentik-proxy`** trên Hub (hoặc trên máy local ở chế độ 1-server), ánh xạ biến `.env` `AUTHENTIK_OUTPOST_TOKEN` vào biến môi trường `AUTHENTIK_TOKEN` của container.
+3. Cấu hình Proxy Provider (qua Blueprint tự động):
+   * `external_host`: `https://${OPENMANAGER_PUBLIC_DOMAIN}`
+   * `internal_host`: `http://openmanager-router:8080` (`internal_host_ssl_validation: false`, giao tiếp HTTP nội bộ trong mạng cô lập `mgmt_internal`).
+   * `authorization_flow`: `default-provider-authorization-implicit-consent`, gắn `PolicyBinding` chỉ cho phép Group `${AUTHENTIK_ALLOWED_GROUP}` (`infra-admins`).
+4. **Chính sách khi mất kết nối IdP (Failure Policy):** Nếu `Authentik Main` gián đoạn, `authentik-proxy` chặn đóng (fail-closed) các phiên đăng nhập mới vào Portal quản trị, nhưng **tuyệt đối không gây ảnh hưởng** tới lưu lượng Data Plane đang chạy trên bất kỳ Server vệ tinh nào.
+
+### FR-06: Quản trị Tập trung với `HAProxy OpenManager` (Zero-Nginx) & `haproxy-agent` Khóa An toàn
+1. **Triển khai Central `haproxy-openmanager` trên Hub (`OPENMANAGER_TAG=1.12.3`):**
+   * Gồm `openmanager-postgres` (`postgres:15-alpine`), `openmanager-redis` (`redis:7-alpine`), `openmanager-backend` (`:8000`), `openmanager-frontend` (`:3000`) và **`openmanager-router` (`haproxy:3.0-alpine`)** thay thế hoàn toàn container `nginx` mặc định của OpenManager.
+   * Không mở trực tiếp cổng Postgres, Redis, Backend hay Frontend ra mạng LAN; chỉ mở cổng loopback nội bộ về phía HAProxy / `authentik-proxy`.
+2. **Cơ chế Điều khiển Các Server Vệ tinh qua `haproxy-agent` (Pull Model):**
+   * Trên mỗi Server vệ tinh có IP LAN riêng, khai báo tương ứng Cluster/Pool trên OpenManager để quản lý độc lập cấu hình bind `${HOST_LAN_IP}:443` và danh sách SNI Outbound của từng máy chủ (hoặc theo cụm đồng nhất).
+   * `haproxy-agent` chạy dưới dạng systemd service trên Host của Server vệ tinh, định kỳ mỗi `30s` gọi HTTPS (`X-API-Key`) về `https://${OPENMANAGER_PUBLIC_DOMAIN}` để:
+     1. Tải chứng chỉ SSL mới về `/etc/ssl/haproxy/*.pem` (quyền `0600`, sở hữu `root:root`).
+     2. Tải cấu hình mới (Partial Config gồm Frontends + Backends), ghép tự động với phần `global` + `resolvers host_dns` + `defaults` + `listen prometheus_exporter` được bảo toàn tại chỗ trên Server vệ tinh.
+     3. Kiểm tra cú pháp bằng shim `/usr/local/sbin/haproxy -c` trước khi gọi `systemctl reload haproxy` (`SIGUSR2`), và đẩy số liệu thực tế từ `/var/run/haproxy/admin.sock` về Hub.
+3. **Khóa Bảo mật Chống Leo thang Đặc quyền & Tách Khóa TLS (`Anti-RCE & Key Separation`):**
+   * **Vô hiệu hóa tính năng tự nâng cấp script từ UI:** Kịch bản `scripts/install-openmanager-agent.sh` gỡ bỏ nhánh tự ghi đè `/usr/local/bin/haproxy-agent` từ API và đặt cờ bất biến của nhân Linux **`chattr +i /usr/local/bin/haproxy-agent`** (`chown root:root`, `chmod 0500`).
+   * **Tách quyền đọc khóa riêng tư TLS:** Container `haproxy` khởi chạy tiến trình master để đọc `/etc/ssl/haproxy/*.pem` (`0600 root:root`) lúc nạp cấu hình rồi hạ quyền toàn bộ các tiến trình worker xử lý mạng xuống user `haproxy` (UID `99`) thông qua chỉ thị `user haproxy` / `group haproxy` trong `global`.
+
+### FR-07: Cập nhật Cấu hình Nguyên tử (Atomic Apply), Graceful Drain & Rollback
+1. Mọi thay đổi trên OpenManager đều đi qua quy trình `PENDING` → xem trước Diff → kiểm tra cú pháp `haproxy -c` → `APPLIED`, lưu vết lịch sử phiên bản đầy đủ kèm khả năng khôi phục 1-click (Rollback).
+2. Khi reload trên từng node (`haproxy-ctl reload` / `SIGUSR2`):
+   * Bản cấu hình đang chạy được sao lưu tự động vào `/etc/haproxy/backups/` kèm ghi nhận vào `/var/log/haproxy-control-audit.log`.
+   * Tiến trình worker mới tiếp nhận ngay `100%` kết nối mới; worker cũ chuyển sang trạng thái **graceful drain** cho phép các request đang xử lý hoàn tất trong khoảng thời gian `hard-stop-after` (`60s`), sau đó mới đóng cưỡng chế các kết nối TCP/WebSocket còn treo quá hạn.
+3. Trang bị công cụ cứu hộ cục bộ `/usr/local/bin/haproxy-ctl rollback` cho phép khôi phục ngay tức thì cấu hình trên Server vệ tinh qua Console/Bastion nếu mất kết nối dài hạn tới Hub.
 
 ---
 
-## 6. Yêu cầu Chức năng Chi tiết (Functional Requirements)
+## 6. Yêu cầu Phi Chức năng: Giám sát, Sao lưu Khôi phục & Bảo mật (NFRs)
 
-### FR-01: Chuẩn hóa Hệ điều hành Host, Dummy Interface & Docker Daemon
-1. **Khóa cứng `ip_forward = 0` bền vững qua Reboot:**
-   * Thiết lập `net.ipv4.ip_forward = 0` trong `/etc/sysctl.d/99-security-hardening.conf`.
-   * Cấu hình `/etc/docker/daemon.json` với `"ip-forward": false` để ngăn Docker Daemon tự động bật lại `ip_forward = 1` khi khởi động dịch vụ.
-2. **Thiết lập Giao diện mạng ảo `dummy0` cho chiều Outbound:**
-   * Khởi tạo interface `dummy0` ở tầng OS (qua `systemd-networkd` hoặc `NetworkManager`) mang địa chỉ IP tĩnh `10.254.254.1/32`, tự động kích hoạt trước `docker.service`.
-   * Cấu hình `"host-gateway-ip": "10.254.254.1"` trong `/etc/docker/daemon.json`. Mọi khai báo `extra_hosts: "<domain>:host-gateway"` từ bất kỳ bridge network nào đều trỏ đồng nhất về `10.254.254.1`, đồng thời đảm bảo HAProxy không bao giờ mất IP lắng nghe khi các mạng Docker được tạo mới hoặc xóa đi (`docker compose down`).
-   * Đảm bảo cấu hình `rp_filter` trên các interface `br-*` không chặn gói tin cục bộ đi tới `10.254.254.1`.
-3. **Bảo vệ Port Publish mặc định của Docker:**
-   * Giữ `"userland-proxy": true` và đặt `"ip": "127.0.0.1"` trong `/etc/docker/daemon.json` để mọi container publish port mặc định chỉ gắn vào loopback `127.0.0.1`, ngăn chặn truy cập vượt mặt HAProxy từ mạng LAN.
-4. **Cấu hình Firewall trên Host (`iptables` / `firewalld` / `ufw`):**
-   * Cho phép traffic trên card mạng vật lý vào `<Host_LAN_IP>:80` và `<Host_LAN_IP>:443`.
-   * Cho phép traffic ở chain `INPUT` từ các interface bridge của Docker (`docker0`, `br-*`) đi tới `10.254.254.1:443` (và `:80` nếu bật Outbound HTTP).
-   * Cho phép traffic ở chain `INPUT` **chỉ riêng từ dải mạng quản trị `mgmt_internal` (`172.25.0.0/24`)** đi tới cổng SSH (`TCP 22`) của chính Host đó để container `roxy-wi` thực thi tác vụ quản trị; chặn hoàn toàn cổng `22` giữa các server theo quy định bảo mật.
-
-### FR-02: Định tuyến Chiều Inbound trên HAProxy (HTTPS / HTTP/2)
-1. Triển khai HAProxy bằng container image tối giản bản LTS (VD: `haproxy:3.0-alpine` hoặc `haproxy:3.2-alpine`) với `network_mode: host`.
-2. Cấu hình Frontend Inbound HTTP (`<Host_LAN_IP>:80`) tự động chuyển hướng `HTTP 301` sang `HTTPS`.
-3. Cấu hình Frontend Inbound HTTPS (`<Host_LAN_IP>:443`):
-   * Bật TLS Termination (tối thiểu `TLSv1.2`, ưu tiên `TLSv1.3`) và đàm phán `alpn h2,http/1.1`.
-   * Làm sạch và gắn đầy đủ các header chuyển tiếp: `X-Forwarded-For` (`option forwardfor`), `X-Forwarded-Proto: https`, giữ nguyên `Host` header.
-   * Cấu hình `tune.bufsize 32768` trong block `global` để xử lý an toàn các cookie phiên OIDC kích thước lớn của Authentik mà không gây lỗi `400 Bad Request`.
-4. Định tuyến dựa trên `Host` header về các cổng loopback tương ứng trên Host (`127.0.0.1:<port_expose>`):
-   * Domain ứng dụng nghiệp vụ → `127.0.0.1:<app_port>`
-   * Domain Roxy-WI của node (`roxy-nodeX.domain.com`) → `127.0.0.1:9000` (`authentik-proxy`)
-   * *(Chỉ trong chế độ Local 1-Server)* Domain Authentik Main (`auth.local.test`) → `127.0.0.1:9001` (`authentik-server`)
-
-### FR-03: Định tuyến Chiều Outbound trên HAProxy (TCP SNI Passthrough)
-1. Cấu hình Frontend Outbound TLS lắng nghe cố định trên `10.254.254.1:443` ở chế độ `mode tcp`:
-   * Thiết lập `tcp-request inspect-delay 5s` và chỉ chấp nhận gói `TLS ClientHello` hợp lệ (`req.ssl_hello_type 1`).
-   * Thiết lập quy tắc từ chối mặc định (`tcp-request content reject` / không khai báo `default_backend`) đối với mọi kết nối không chứa SNI hoặc SNI không nằm trong danh sách Whitelist.
-2. Định tuyến theo ACL `req.ssl_sni -i <domain>` sang các Backend tương ứng mà **không giải mã TLS**:
-   * Với các domain đối tác bên ngoài (`Domain B`): sử dụng block `resolvers` đọc DNS thật của Host (tránh stub `127.0.0.53`), cấu hình bắt buộc `accepted_payload_size 8192`, `resolve-prefer ipv4`, `default-server init-addr last,libc,none` và **không bật active health check (`check`)** để tránh bị đối tác chặn IP hoặc làm treo HAProxy khi DNS đối tác gặp sự cố.
-   * Với domain của `Authentik Main` (`auth.main-domain.com` hoặc `auth.local.test`): ưu tiên trỏ thẳng về IP tĩnh `<Authentik_Main_IP>:443` (trên môi trường 1-Server là `<Host_LAN_IP>:443`), cấu hình `timeout client`/`timeout server` dài (`300s`–`3600s`) kèm `option clitcpka` và `option srvtcpka` để giữ kết nối WebSocket Outpost (`/ws/outpost/`) ổn định không bị ngắt quãng.
-3. *(Tùy chọn mở rộng)* Nếu có ứng dụng cần gọi HTTP thuần (Port `80`) ra ngoài: tách một Frontend Outbound riêng trên `10.254.254.1:80` chạy ở `mode http` và lọc Whitelist theo header `hdr(host)`.
-
-### FR-04: Tích hợp Ứng dụng Nghiệp vụ (Service A) & Ứng dụng Kiểm thử (Mock App)
-1. Các ứng dụng nghiệp vụ giữ nguyên chế độ mạng `bridge` độc lập của từng dự án.
-2. Cấu hình `ports` chỉ lắng nghe trên loopback: `"127.0.0.1:<port_expose>:<container_port>"`.
-3. Khai báo danh sách các domain cần gọi ra ngoài trong `extra_hosts` với cú pháp chuẩn `"<domain-b>:host-gateway"`.
-4. Dự án cung cấp sẵn một **Mock Service A** để phục vụ kiểm thử tự động: trả về thông tin HTTP/headers khi gọi Inbound, và có endpoint/script kiểm tra gọi HTTPS Outbound ra domain mẫu bên ngoài.
-
-### FR-05: Xác thực Tập trung với Authentik Main & Authentik Proxy Outpost
-1. **Đồng bộ phiên bản nghiêm ngặt:** Container `ghcr.io/goauthentik/proxy:${AUTHENTIK_TAG}` trên tất cả các server vệ tinh bắt buộc ghim cứng phiên bản khớp chính xác với `ghcr.io/goauthentik/server:${AUTHENTIK_TAG}` trên Server chính (tuyệt đối không dùng tag `:latest`).
-2. **Cấu hình trên Authentik Main:**
-   * Với mỗi server vệ tinh (hoặc node local), khởi tạo bộ **Proxy Provider (Mode: Standalone Proxy) + Application + Outpost riêng biệt** để cô lập phạm vi ảnh hưởng của `AUTHENTIK_TOKEN`.
-   * Thông số Proxy Provider:
-     * `External host`: `https://roxy-nodeX.domain.com`
-     * `Internal host`: `https://roxy-wi:443`
-     * `Internal host SSL Validation`: **`false`** (do chứng chỉ bên trong container Roxy-WI là tự ký).
-     * `Authorization flow`: Chọn luồng **`Implicit consent`** để người dùng đã đăng nhập SSO chuyển giữa các server vệ tinh không phải bấm xác nhận lại.
-   * Gắn Policy/Group binding: chỉ cho phép thành viên nhóm quản trị hạ tầng (đã xác thực MFA) truy cập; các tài khoản khác nhận mã `403 Forbidden` ngay tại tầng Proxy.
-   * Cung cấp **Authentik Blueprint (YAML)** tự động hóa việc tạo Provider/App/Outpost để dễ dàng khởi tạo nhanh ở môi trường Local 1-Server cũng như nhân bản hàng loạt trên Production.
-3. **Cấu hình container `authentik-proxy` trên Server vệ tinh:**
-   * Đặt trong mạng nội bộ `mgmt_internal` (`172.25.0.0/24`), chỉ mở port `"127.0.0.1:9000:9000"`.
-   * Khai báo `"auth.main-domain.com:host-gateway"` trong `extra_hosts` để mọi lưu lượng xác thực và WebSocket đi qua HAProxy Outbound SNI Passthrough.
-   * Hỗ trợ biến `AUTHENTIK_INSECURE` (chỉ bật `"true"` khi dùng chứng chỉ tự ký ở môi trường Local Test; bắt buộc `"false"` trên Production).
-
-### FR-06: Portal Quản trị Roxy-WI & Cơ chế SSH Đặc quyền Tối thiểu
-1. Sử dụng phiên bản Roxy-WI đã vá các lỗ hổng thực thi mã từ xa và tiêm lệnh (tối thiểu từ `8.2.8.2` trở lên hoặc nhánh container chính thức `9.1.x+`).
-2. Cô lập hoàn toàn trong mạng `mgmt_internal`, **không khai báo `ports` ra Host**, chỉ nhận lưu lượng từ `authentik-proxy`.
-3. Gắn đầy đủ các Docker Volumes lưu trữ bền vững dữ liệu (`/var/lib/roxy-wi`, `/etc/roxy-wi`, SSH keys) để không mất cấu hình khi nâng cấp/tái tạo container.
-4. **Cơ chế kết nối SSH an toàn từ Roxy-WI vào Host vệ tinh:**
-   * Roxy-WI kết nối tới chính Host chứa nó qua địa chỉ `host.docker.internal:22` (ánh xạ về `10.254.254.1` hoặc gateway của `mgmt_internal`).
-   * Tạo tài khoản hệ thống riêng `roxyadmin` trên Host, **tuyệt đối không thêm vào group `docker`**.
-   * Cấp quyền đọc/ghi chia sẻ trên `/etc/haproxy` giữa `roxyadmin` và user `haproxy` (UID `99` trong container) thông qua Group chung (`setgid` `chmod 2770`) hoặc POSIX ACL để không lỗi quyền đọc chứng chỉ `.pem` và file cấu hình.
-   * Giới hạn `sudoers` cho `roxyadmin` chỉ được phép chạy các script/lệnh wrapper kiểm tra cấu hình (`haproxy -c -V -f`), xem trạng thái/log container HAProxy và gửi tín hiệu reload (`docker kill -s USR2 haproxy`).
-
-### FR-07: Vận hành Zero-Downtime Reload & Công cụ Cứu hộ (Break-Glass)
-1. Cấu hình HAProxy chạy chế độ `master-worker` (`-W`) kèm chỉ thị `hard-stop-after 60s` để giải phóng dứt điểm các tiến trình worker cũ sau khi reload, tránh rò rỉ bộ nhớ.
-2. Mọi lệnh reload kích hoạt từ Roxy-WI hoặc CLI đều phải đi qua bước kiểm tra cú pháp tự động (`docker exec haproxy haproxy -c -V -f /usr/local/etc/haproxy/haproxy.cfg`); nếu cấu hình lỗi, giữ nguyên tiến trình đang chạy và trả mã lỗi rõ ràng.
-3. Cung cấp bộ script CLI cục bộ trên Host (`scripts/haproxy-ctl.sh`) hỗ trợ: backup tự động trước mỗi lần sửa, rollback về bản cấu hình hợp lệ gần nhất và khởi động lại HAProxy ngay từ Console/Bastion khi mất đường vào Web UI.
-
----
-
-## 7. Yêu cầu Phi Chức năng (Non-Functional Requirements)
-
-| Nhóm | Yêu cầu chi tiết |
+| Hạng mục | Đặc tả yêu cầu bắt buộc |
 | :--- | :--- |
-| **Bảo mật (Security)** | - Container HAProxy phải được khóa quyền: `cap_drop: ["ALL"]`, `cap_add: ["NET_BIND_SERVICE"]`, `security_opt: ["no-new-privileges:true"]` nhằm ngăn chặn leo thang đặc quyền ngay cả khi file `haproxy.cfg` bị can thiệp.<br>- Toàn bộ biến nhạy cảm (`AUTHENTIK_TOKEN`, `SECRET_KEY`, mật khẩu DB Local IdP, đường dẫn SSH key) phải quản lý qua file `.env` phân quyền `0600`, không lưu cứng trong Git. |
-| **Độ tin cậy (Reliability)** | - Đạt `0%` tỷ lệ lỗi kết nối ở các luồng đang mở khi thực hiện reload cấu hình.<br>- Tự động phục hồi đầy đủ trạng thái các dịch vụ (`restart: unless-stopped`, systemd unit cho `dummy0`) sau khi máy chủ khởi động lại mà không cần thao tác tay. |
-| **Khả năng Bảo trì & Mở rộng (Maintainability)** | - Mã nguồn cấu hình tổ chức dạng mô-đun rõ ràng; phân tách cấu hình môi trường (`local-single-node` vs `prod-hub` / `prod-satellite`) hoàn toàn qua Docker Compose Profiles và biến môi trường.<br>- Khi số lượng domain Outbound tăng lớn và biến động liên tục trong tương lai, kiến trúc cho phép cắm thêm một Forward Proxy nhẹ (như Tinyproxy trên Host) cho các ứng dụng hỗ trợ `HTTPS_PROXY` mà không phá vỡ cấu trúc hiện tại. |
+| **Observability (Metrics & Logs)** | - **Tập trung trên UI:** `haproxy-agent` thu thập CSV từ `/var/run/haproxy/admin.sock` mỗi `30s` đẩy về OpenManager hiển thị biểu đồ Request Rate, Latency Heatmap và trạng thái Backend.<br>- **Chuẩn Prometheus độc lập:** Mỗi HAProxy bật sẵn block `listen prometheus_exporter` trên `127.0.0.1:${HAPROXY_METRICS_PORT}` (`/metrics` & `/stats`) để tích hợp trực tiếp với Prometheus/Grafana doanh nghiệp khi cần.<br>- **Audit Log:** Lưu vết toàn bộ thao tác người dùng trên Authentik + OpenManager, và ghi audit mọi lệnh điều khiển HAProxy trên Host qua `syslog`/`/var/log/haproxy-control-audit.log`. |
+| **Disaster Recovery (`RPO` / `RTO`)** | - **Mục tiêu:** `RPO <= 24 giờ` (và trước mỗi thay đổi lớn), `RTO <= 30 phút`.<br>- **Phạm vi sao lưu (`scripts/backup-restore.sh`):** Sao lưu định kỳ `pg_dump` của cả 2 cơ sở dữ liệu `authentik-postgresql` và `openmanager-postgres`, file `.env` (mã hóa) trên Hub, cùng bản chụp `/etc/haproxy` và `/etc/ssl/haproxy` trên từng node.<br>- Khi mất hoàn toàn Server Hub, toàn bộ các Server vệ tinh vẫn tiếp tục chạy bình thường với cấu hình cuối cùng trên đĩa cho đến khi Hub được khôi phục. |
+| **Quản lý CVE, Pinning & Giấy phép** | - Cấm tuyệt đối sử dụng tag `:latest` trên mọi container image (`haproxy`, `authentik`, `openmanager`, `postgres`, `redis`).<br>- Ghi nhận `haproxy-openmanager` sử dụng giấy phép mã nguồn mở `AGPL-3.0`: hệ thống chỉ triển khai làm công cụ vận hành hạ tầng nội bộ (không sửa đổi mã nguồn lõi để phân phối dịch vụ thương mại ra công chúng). |
 
 ---
 
-## 8. Giả định, Ràng buộc & Quản trị Rủi ro (Assumptions & Risk Matrix)
+## 7. Cấu trúc Thư mục Dự án Chuẩn hóa (`v1.1.0`)
 
-### 8.1. Ràng buộc & Thống nhất Kỳ vọng Nghiệm thu
-1. **Hành vi đăng nhập 2 lớp ("Double Login") với Roxy-WI Community:**
-   * Do Roxy-WI bản Community không hỗ trợ tự động ánh xạ HTTP Header (`X-authentik-username`) sang phiên đăng nhập nội bộ, việc tích hợp `authentik-proxy` đóng vai trò **cổng xác thực SSO bảo vệ lớp ngoài**: quản trị viên đăng nhập SSO 1 lần trên Authentik sẽ tự động đi qua lớp cổng bảo vệ của tất cả các server vệ tinh, sau đó đăng nhập phiên cục bộ bên trong giao diện Roxy-WI. Hành vi này được xác nhận là chuẩn thiết kế để không phải can thiệp mã nguồn Roxy-WI hoặc mua gói Enterprise.
-2. **Phạm vi Outbound SNI Passthrough:**
-   * Áp dụng cho các kết nối TLS/HTTPS gọi bằng tên miền trên cổng đã định nghĩa (mặc định `443`). Không áp dụng cho các kết nối gọi thẳng bằng địa chỉ IP trần (do không có trường SNI và không đi qua phân giải tên miền `extra_hosts`).
-
-### 8.2. Ma trận Rủi ro & Biện pháp Kiểm soát
-
-| Mã | Rủi ro | Mức độ | Biện pháp giảm thiểu trong thiết kế |
-| :--- | :--- | :---: | :--- |
-| **R-01** | Phụ thuộc vòng (Circular Dependency): Lỗi cấu hình HAProxy hoặc đứt kết nối tới Authentik Main làm khóa luôn giao diện Roxy-WI trên server vệ tinh. | Cao | Bắt buộc kiểm tra `haproxy -c` trước khi gửi `USR2`; trang bị script cứu hộ `haproxy-ctl.sh rollback` qua kênh truy cập Out-of-Band Console / Bastion nội bộ. |
-| **R-02** | Xung đột IP `host-gateway` hoặc mất interface mạng khi `docker compose down` làm HAProxy không khởi động được. | Cao | Sử dụng interface ảo `dummy0` (`10.254.254.1/32`) khởi tạo từ OS kết hợp `"host-gateway-ip": "10.254.254.1"` trong `daemon.json`, tách rời hoàn toàn khỏi vòng đời mạng Docker. |
-| **R-03** | Lỗi DNS của đối tác bên ngoài làm HAProxy từ chối reload, kéo sập luôn chiều Inbound. | Cao | Bắt buộc khai báo `default-server init-addr last,libc,none`, `resolve-prefer ipv4` và tắt health check chủ động cho các domain ngoài. |
-| **R-04** | Khai thác lỗ hổng Post-Auth trên Roxy-WI hoặc leo thang đặc quyền qua SSH user. | Trung bình | Ghim bản Roxy-WI đã vá lỗi (`>= 8.2.8.2` / `9.1.x+`), bật MFA trên Authentik, không gán group `docker` cho user SSH, giới hạn `sudo` qua wrapper script và khóa capabilities của container HAProxy. |
-| **R-05** | Đứt kết nối WebSocket Outpost hoặc lỗi `400 Cookie Too Large` sau khi đăng nhập SSO. | Trung bình | Tăng `tune.bufsize 32768`, bật TCP keepalive và tăng timeout cho backend Outbound nối về Authentik Main. |
-
----
-
-## 9. Đề xuất Cấu trúc Dự án & Lộ trình Triển khai (Project Structure & Roadmap)
-
-### 9.1. Cấu trúc Thư mục Dự án (`rpa-prory`)
 ```text
-rpa-prory/
-├── BRD.md                          # Tài liệu đặc tả yêu cầu nghiệp vụ & kỹ thuật
-├── .env.example                    # Mẫu biến môi trường (hỗ trợ cả Local 1-Server & Prod)
-├── docker-compose.yml              # Stack chính (HAProxy + Satellite Mgmt: authentik-proxy, roxy-wi)
-├── docker-compose.local-idp.yml    # Stack mở rộng cho Local Test 1-Server (Authentik Main + Mock App)
+rpa-revert-proxy/
+├── .agents/skills/                     # 4 bộ kỹ năng chuyên biệt (Architecture, HAProxy, Authentik, OpenManager)
+├── AGENTS.md                           # Quy tắc dự án & cổng kiểm tra đồng bộ .env.example <-> .env
+├── BRD.md                              # Tài liệu đặc tả yêu cầu nghiệp vụ & kỹ thuật v1.1.0
+├── README.md                           # Tổng quan kiến trúc & hướng dẫn nhanh
+├── docs/
+│   └── RUNBOOK.md                      # Quy trình triển khai 1-Server, Hub/Satellite, Backup/DR & Break-glass
+├── .env.example                        # Schema biến môi trường chuẩn (Single Source of Truth)
+├── docker-compose.yml                  # Stack Data Plane chạy trên MỌI node (HAProxy 3.0 network_mode: host)
+├── docker-compose.hub.yml              # Stack Control Plane cho Hub & Local 1-Server (Authentik + OpenManager)
+├── docker-compose.mock-app.yml         # Ứng dụng kiểm thử Service A (Inbound HTTP/2 & Outbound SNI/Egress)
 ├── host-setup/
-│   ├── daemon.json.tpl             # Mẫu cấu hình /etc/docker/daemon.json chuẩn hardening
-│   ├── 99-haproxy-zero-fwd.conf    # Cấu hình sysctl (ip_forward=0, rp_filter)
-│   ├── dummy0.netdev               # Cấu hình interface ảo 10.254.254.1/32
-│   ├── sudoers-roxyadmin           # Quyền sudo đặc quyền tối thiểu cho Roxy-WI SSH user
-│   └── bootstrap-host.sh           # Script cài đặt tự động tầng OS, ACL thư mục & Firewall
+│   ├── 99-haproxy-zero-fwd.conf        # Khóa cứng IPv4/IPv6 ip_forward = 0 & loose rp_filter
+│   ├── rpa-dummy0.service.tpl          # Systemd unit khởi tạo dummy0 (10.254.254.1/32)
+│   ├── haproxy.service.tpl             # Systemd wrapper đồng bộ container HAProxy với systemctl & Agent
+│   ├── haproxy-cli-shim.sh             # Shim /usr/local/sbin/haproxy chuyển tiếp haproxy -c vào container
+│   ├── daemon.json.tpl                 # Cấu hình Docker Daemon (ip-forward: false, ipv6: false, loopback)
+│   └── bootstrap-host.sh               # Script chuẩn hóa tầng OS & Egress/Ingress Firewall tự động
 ├── haproxy/
-│   ├── haproxy.cfg.tpl             # Cấu hình HAProxy chuẩn (Inbound HTTP/2 + Outbound SNI)
-│   └── certs/                      # Thư mục chứa chứng chỉ TLS (gồm script tạo cert local mkcert/openssl)
-├── authentik/
-│   └── blueprints/                 # Blueprint tự động khởi tạo Provider, App, Group & Outpost
-├── mock-app/                       # Container ứng dụng mẫu (Service A) để test Inbound & Outbound
-└── scripts/
-    ├── haproxy-ctl.sh              # Wrapper validate, zero-downtime reload, backup & rollback
-    └── verify-acceptance.sh        # Script chạy tự động toàn bộ bài test nghiệm thu
+│   ├── haproxy.cfg.tpl                 # Mẫu cấu hình HAProxy (Dual-IP Inbound/Outbound + Prometheus + Socket)
+│   └── openmanager-router.cfg          # Cấu hình HAProxy nội bộ thay thế hoàn toàn Nginx cho OpenManager
+├── authentik/blueprints/
+│   └── 10-openmanager-hub.yaml.tpl     # Blueprint khởi tạo tự động Group, Proxy Provider, App & Outpost
+├── mock-app/                           # Mã nguồn & Dockerfile ứng dụng kiểm thử Service A
+├── scripts/
+│   ├── check_env_sync.py               # Cổng kiểm tra schema, quyền 0600, quét biến toàn diện & dọn khóa thừa
+│   ├── render_configs.py               # Sinh cấu hình tự động theo DEPLOY_MODE (local / hub / satellite)
+│   ├── generate-local-certs.sh         # Sinh Local Root CA & chứng chỉ Multi-SAN cho môi trường PoC
+│   ├── fetch-outpost-token.sh          # Trích xuất tự động AUTHENTIK_OUTPOST_TOKEN từ API Authentik
+│   ├── install-openmanager-agent.sh    # Cài đặt & khóa bất biến (chattr +i) haproxy-agent trên node vệ tinh
+│   ├── haproxy-ctl.sh                  # Công cụ validate, graceful reload có audit log & rollback khẩn cấp
+│   └── backup-restore.sh               # Công cụ sao lưu & khôi phục DB Hub + cấu hình HAProxy (DR)
+└── tests/
+    ├── test_project_integrity.py       # Kiểm thử tự động Offline cấu hình, phân quyền & bất biến bảo mật
+    └── verify-acceptance.sh            # Bộ kiểm thử thực chiến 7 cổng kỹ thuật PoC/UAT trên Linux
 ```
 
-### 9.2. Lộ trình Phát triển 4 Giai đoạn
-* **Giai đoạn 1 — Nền tảng OS & Lõi HAProxy (Inbound/Outbound):** Viết script `bootstrap-host.sh` thiết lập `ip_forward = 0`, `dummy0`, `daemon.json`, Firewall; dựng container HAProxy và `mock-app` chứng minh thành công cả 2 chiều Inbound HTTP/2 và Outbound SNI Passthrough trên 1 máy.
-* **Giai đoạn 2 — Tích hợp Authentik Main + Authentik Proxy + Roxy-WI trên 1 Server (Local Lab):** Dựng stack `docker-compose.local-idp.yml` cùng stack vệ tinh trên 1 máy; xác thực thành công vòng lặp `authentik-proxy` đi qua HAProxy Outbound SNI Passthrough về `Authentik Main` nội bộ và bọc SSO trước `roxy-wi`.
-* **Giai đoạn 3 — Hardening Bảo mật, SSH Least-Privilege & Công cụ Cứu hộ:** Thiết lập user `roxyadmin`, ACL `/etc/haproxy`, kết nối Roxy-WI quản trị HAProxy qua SSH cục bộ, hoàn thiện `haproxy-ctl.sh` và bộ script kiểm thử tự động `verify-acceptance.sh`.
-* **Giai đoạn 4 — Đóng gói Tài liệu Vận hành & Chuyển giao Triển khai Đa Server:** Tách cấu hình `.env` chuẩn cho Server Chính và các Server Vệ tinh, chạy thử nghiệm UAT và nghiệm thu toàn diện.
-
 ---
 
-## 10. Tiêu chí Nghiệm thu Toàn diện (Master Acceptance Criteria)
+## 8. Bộ Cổng Kỹ thuật PoC & Tiêu chí Nghiệm thu Độc lập (Master Acceptance Gates)
 
-### Nhóm A: Hạ tầng OS, Docker & Cô lập Mạng
-- [ ] **AC-A1:** Lệnh `sysctl net.ipv4.ip_forward` trên Host trả về `0` cả trước và sau khi chạy `systemctl restart docker` cũng như sau khi reboot máy chủ.
-- [ ] **AC-A2:** Interface `dummy0` (`10.254.254.1/32`) tự động lên khi khởi động máy; HAProxy khởi động và reload thành công ngay cả khi toàn bộ các mạng Docker ứng dụng và quản trị đang tắt (`docker compose down`).
-- [ ] **AC-A3:** Từ một máy khác trong mạng LAN, quét hoặc gọi trực tiếp vào `<Host_LAN_IP>:<port_expose>` của ứng dụng, cổng `9000` (`authentik-proxy`), cổng `9001` (`authentik-server` bản 1-server) và Roxy-WI đều bị từ chối kết nối.
-- [ ] **AC-A4:** Giữa các máy chủ không mở cổng SSH (`Port 22`) trên mạng LAN, nhưng bên trong Server vệ tinh container `roxy-wi` vẫn SSH cục bộ thành công vào `host.docker.internal:22`.
+Hệ thống chỉ được phép chuyển từ giai đoạn PoC sang triển khai Production Đa Server sau khi vượt qua đầy đủ **7 cổng kiểm thử độc lập** dưới đây:
 
-### Nhóm B: Luồng Inbound & Outbound Nghiệp vụ (Service A)
-- [ ] **AC-B1 (Inbound HTTP/2):** Gọi `curl -I --http2 https://<app-domain>` từ bên ngoài trả về giao thức `HTTP/2 200`, định tuyến đúng vào container `Service A` và ứng dụng nhận đủ header `X-Forwarded-For`, `X-Forwarded-Proto: https`; gọi HTTP cổng `80` tự động trả về `301` sang `HTTPS`.
-- [ ] **AC-B2 (Outbound SNI Whitelist — Hợp lệ):** Bên trong container `Service A`, lệnh `getent hosts <domain-b>` trả về `10.254.254.1`; lệnh `curl -Iv https://<domain-b>` kết nối thành công `200 OK` và xác thực đúng chứng chỉ SSL gốc của `<domain-b>`.
-- [ ] **AC-B3 (Outbound SNI Whitelist — Từ chối):** Bên trong container `Service A`, khi thử gọi HTTPS tới một tên miền bất kỳ **không** nằm trong danh sách cho phép (kể cả khi cố tình ép phân giải về `10.254.254.1`), kết nối bị HAProxy từ chối ngay lập tức.
-
-### Nhóm C: Xác thực SSO (Authentik) & Portal Quản trị (Roxy-WI)
-- [ ] **AC-C1 (Kết nối Outpost qua SNI Passthrough):** Log của container `authentik-proxy` ghi nhận kết nối HTTPS/WebSocket (`/ws/outpost/`) thành công và duy trì ổn định tới `Authentik Main` xuyên qua HAProxy Outbound trong điều kiện `net.ipv4.ip_forward = 0` (cả trên bản test 1-Server lẫn bản Đa Server).
-- [ ] **AC-C2 (Chặn Pre-Auth 100%):** Truy cập trực tiếp bất kỳ đường dẫn nào trên `https://roxy-node1.<domain>` (bao gồm cả các URI API/static của Roxy-WI) khi chưa đăng nhập đều bị chặn và chuyển hướng `HTTP 302` về trang đăng nhập của `Authentik Main`.
-- [ ] **AC-C3 (Kiểm soát Phân quyền RBAC):** Đăng nhập bằng tài khoản hợp lệ trên Authentik nhưng **không** thuộc Group quản trị hạ tầng bị chặn với mã `HTTP 403 Forbidden` ngay tại lớp `authentik-proxy`, hoàn toàn không chạm được tới container `roxy-wi`.
-- [ ] **AC-C4 (SSO Đa Node):** Khi đăng nhập thành công 1 lần bằng tài khoản thuộc Group quản trị trên `Authentik Main`, mở liên tiếp URL của nhiều server vệ tinh khác nhau tự động vượt qua lớp cổng `authentik-proxy` mà không phải xác thực lại OIDC.
-
-### Nhóm D: Vận hành, Bảo mật Đặc quyền & Phục hồi Sự cố
-- [ ] **AC-D1 (Quản trị & Zero-Downtime Reload):** Sửa cấu hình và bấm Reload HAProxy từ giao diện Roxy-WI hoạt động không lỗi trong khi đang bắn tải liên tục (`0` request bị ngắt kết nối); các tiến trình worker cũ tự động thu hồi sau thời gian `hard-stop-after`.
-- [ ] **AC-D2 (Chống sập do cấu hình sai hoặc lỗi DNS ngoài):** Khi cố tình nhập sai cú pháp `haproxy.cfg` hoặc khi một `<domain-b>` bên ngoài không phân giải được DNS, tiến trình HAProxy hiện hành vẫn tiếp tục phục vụ bình thường chiều Inbound, không bị sập dịch vụ.
-- [ ] **AC-D3 (Bảo toàn dữ liệu & Giới hạn đặc quyền):** Chạy `docker compose down && docker compose up -d` đối với cụm `roxy-wi` không làm mất cấu hình đã lưu; user SSH `roxyadmin` không nằm trong group `docker` và không thể thực thi lệnh trái phép ngoài danh sách cho phép trong `sudoers`.
+| Mã Cổng | Điều kiện & Kịch bản Kiểm thử | Kết quả Đo lường Bắt buộc |
+| :--- | :--- | :--- |
+| **`NET-01`** | Đặt `ip_forward=0` (IPv4 & IPv6), chạy `systemctl restart docker` và reboot toàn bộ Host; tắt/bật lại các mạng Docker ứng dụng. | `sysctl net.ipv4.ip_forward` và `net.ipv6.conf.all.forwarding` giữ nguyên `0`; `dummy0` giữ IP `10.254.254.1/32`; cả Inbound HTTP/2 lẫn Outbound SNI Passthrough qua HAProxy hoạt động thông suốt. |
+| **`NET-02`** | Từ một máy khác trong cùng mạng LAN, quét và gọi trực tiếp vào các cổng nội bộ (`8081`, `9000`, `9001`, `9002`, `8405`, `5432`, `6379`). | `100%` kết nối trực tiếp từ mạng LAN bị từ chối; chỉ có cổng `80` và `443` trên `${HOST_LAN_IP}` mở nhận lưu lượng. |
+| **`EGRESS-01`** | Từ bên trong container `Service A`, thử gọi: (a) domain nằm trong allowlist, (b) domain ngoài allowlist ép trỏ về `10.254.254.1`, (c) địa chỉ IP công cộng trần (`https://1.1.1.1`), (d) IPv6 và UDP `:443` (QUIC). | Chỉ trường hợp (a) thành công `200 OK` với chứng chỉ gốc của đối tác; toàn bộ các trường hợp (b), (c), (d) đều bị chặn đứng bởi HAProxy hoặc Host Firewall, không tồn tại đường đi vòng. |
+| **`SSO-01`** | Kiểm thử truy cập `https://${OPENMANAGER_PUBLIC_DOMAIN}` với: (a) chưa đăng nhập, (b) user không thuộc Group `infra-admins`, (c) user hợp lệ thuộc `infra-admins`, (d) giả lập dừng `Authentik Main`, (e) giả mạo header `X-API-Key` sai gọi vào `/api/agents/heartbeat` và `/`. | (a) Bị redirect `302` về Authentik; (b) Bị chặn `403` ngay tại `authentik-proxy`; (c) Vào được giao diện OpenManager; (d) Khóa đăng nhập mới nhưng HAProxy vệ tinh vẫn phục vụ bình thường; (e) Gọi `/` vẫn bị ép SSO `302`, gọi `/api/agents/*` sai key bị trả `401`. |
+| **`AGENT-01`** | Trên OpenManager UI, thêm/sửa Frontend/Backend/SSL và bấm **Apply Changes**; thử kiểm tra ghi đè file `/usr/local/bin/haproxy-agent` trên Server vệ tinh. | `haproxy-agent` trên Server vệ tinh tự kéo cấu hình mới qua HTTPS trong chu kỳ `30s`, bảo toàn nguyên vẹn `global`/`resolvers`/`defaults`/`listen`, kiểm tra `haproxy -c`, reload thành công và đẩy live stats về Dashboard; mọi nỗ lực sửa file `/usr/local/bin/haproxy-agent` bị nhân Linux từ chối (`Operation not permitted` do `chattr +i`). |
+| **`RELOAD-01`** | Chạy tải HTTP/2 liên tục kết hợp giữ 1 kết nối TCP/WebSocket dài hạn vượt quá `hard-stop-after`, sau đó kích hoạt reload cấu hình. | `0` lỗi trên các request HTTP/2 mới và các request hoàn tất trước ngưỡng `60s`; kết nối treo quá `hard-stop-after` được thu hồi đúng thời hạn và tiến trình worker cũ giải phóng hoàn toàn khỏi bộ nhớ; ghi đầy đủ dòng log trong `/var/log/haproxy-control-audit.log`. |
+| **`DR-01`** | Chạy `scripts/backup-restore.sh backup`, xóa thử container + dữ liệu cấu hình mẫu, sau đó chạy quy trình `restore`. | Khôi phục toàn vẹn cơ sở dữ liệu Authentik, cơ sở dữ liệu OpenManager (gồm lịch sử version & danh sách Agent) và cấu hình HAProxy trong thời gian `< 30 phút` (`RTO`). |

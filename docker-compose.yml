@@ -1,0 +1,31 @@
+# ==============================================================================
+# docker-compose.yml — Data Plane HAProxy Engine (Runs on ALL Nodes: Hub & Satellites)
+# Inbound HTTP/2 + Outbound TCP SNI Passthrough + Stats Socket + Prometheus (:8405)
+# ==============================================================================
+
+services:
+  haproxy:
+    image: ${HAPROXY_IMAGE}
+    container_name: haproxy
+    restart: unless-stopped
+    network_mode: host
+    user: "0:0"
+    # Master starts as root ONLY to read 0600 /etc/ssl/haproxy/*.pem on reload,
+    # then drops worker processes to unprivileged `user haproxy` (UID 99) per haproxy.cfg!
+    command: ["haproxy", "-W", "-db", "-f", "/etc/haproxy/haproxy.cfg"]
+    environment:
+      TZ: "${TZ}"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - SETUID
+      - SETGID
+      - DAC_READ_SEARCH
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ${HAPROXY_CONFIG_HOST_DIR}:/etc/haproxy:ro
+      - ${HAPROXY_SSL_HOST_DIR}:/etc/ssl/haproxy:ro
+      - ${HAPROXY_RUNTIME_SOCKET_DIR}:/var/run/haproxy:rw
